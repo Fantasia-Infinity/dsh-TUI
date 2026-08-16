@@ -1,19 +1,31 @@
 import React from 'react'
+import { readFile, unlink } from 'node:fs/promises'
+import { basename } from 'node:path'
 import { t } from '../i18n.js'
 import { Box, Text, useInput, useTerminalSize } from '../ui.js'
 import { useDeclaredCursor } from '../ink/hooks/use-declared-cursor.js'
 import { stringWidth } from '../ink/stringWidth.js'
 import { formatClipboardInsert, readClipboard } from '../utils/clipboard.js'
-import type { Channel } from '../channel.js'
-import { filterCommands, parseCommandName } from '../commands.js'
+import { editInExternalEditor } from '../utils/externalEditor.js'
+import type { Channel } from '../dsh-adapter/channel.js'
+import { parseCommandName } from '../commands.js'
 import { appendHistory } from '../history.js'
 import { mentionAtCaret } from '../utils/mentions.js'
 import { isMod } from '../utils/modifiers.js'
 import { CommandSuggestions } from './CommandSuggestions.js'
 import { FileSuggestions } from './FileSuggestions.js'
 import { HelpMenu } from './HelpMenu.js'
+import { OverlayAbove } from './OverlayAbove.js'
 
 const HISTORY_LIMIT = 50
+
+function clipboardImageMediaType(path: string): 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif' | undefined {
+  if (/\.png$/iu.test(path)) return 'image/png'
+  if (/\.jpe?g$/iu.test(path)) return 'image/jpeg'
+  if (/\.webp$/iu.test(path)) return 'image/webp'
+  if (/\.gif$/iu.test(path)) return 'image/gif'
+  return undefined
+}
 
 /** Index of the word boundary at or before `cursor` (readline alt+b). */
 function wordBoundaryLeft(text: string, cursor: number): number {
@@ -86,7 +98,7 @@ export interface PromptInputProps {
  * only), `❯ ` prompt char (dimmed while a turn is working), the text with a
  * block cursor at the cursor position, and below it the slash-command
  * suggestion overlay (name column + description, selected row in the
- * `suggestion` color — ported from the leak's PromptInputFooterSuggestions).
+ * `suggestion` color — mirroring Claude Code's PromptInputFooterSuggestions).
  *
  * Empty input: a solid block caret on a blank cell and nothing else — no
  * placeholder text, so the terminal-painted IME preedit (pinyin) at the
@@ -96,8 +108,9 @@ export interface PromptInputProps {
  * the input spans multiple lines (history/command selection otherwise); the
  * visible window scrolls to keep the caret row on screen past
  * MAX_VISIBLE_LINES. Enter submits, backspace/delete edit, ←/→ move the
- * cursor, Tab completes the selected command, Escape clears (or closes the
- * help menu), `?` toggles the help menu. Windows ConPTY pipelines deliver
+ * cursor, Tab completes the selected command, Ctrl+X opens the draft in the
+ * external editor ($VISUAL/$EDITOR), Escape clears (or closes the help
+ * menu), `?` toggles the help menu. Windows ConPTY pipelines deliver
  * whole lines with the Enter key lost: a trailing CR/LF in the input marks
  * a complete line to submit.
  *
@@ -123,6 +136,10 @@ export function PromptInput({
 }: PromptInputProps) {
   const [value, setValue] = React.useState('')
   const [cursor, setCursor] = React.useState(0)
+  const valueRef = React.useRef(value)
+  const cursorRef = React.useRef(cursor)
+  valueRef.current = value
+  cursorRef.current = cursor
   // Publish the live controller (fresh closure over `value` every render).
   // clear() mirrors the double-tap-Esc clear: text + caret reset.
   React.useEffect(() => {
@@ -157,6 +174,18 @@ export function PromptInput({
   const escTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   /** True while a Ctrl+V clipboard read is in flight (ignore repeat keys). */
   const clipboardBusyRef = React.useRef(false)
+  /** True while the external editor owns the terminal (Ctrl+X round-trip). */
+  const editorBusyRef = React.useRef(false)
+  /**
+   * Latest committed input state. The Ctrl+V clipboard read resolves
+   * asynchronously; inserting against the render that STARTED the read
+   * would drop whatever the user typed while waiting. The continuation
+   * inserts against this mirror instead.
+   */
+  const liveInputRef = React.useRef({ value: '', cursor: 0 })
+  React.useEffect(() => {
+    liveInputRef.current = { value, cursor }
+  })
   /** Enter dedupe window: cmd pipelines can deliver one Enter as `\r`+`\n`. */
   const lastEnterAtRef = React.useRef(0)
   React.useEffect(() => {
@@ -164,11 +193,9 @@ export function PromptInput({
       if (escTimerRef.current) clearTimeout(escTimerRef.current)
     }
   }, [])
-  const { columns } = useTerminalSize()
+  const { columns, rows: terminalRows } = useTerminalSize()
 
-  const suggestions = value.startsWith('/')
-    ? filterCommands(value, channel.commandList)
-    : []
+  const suggestions = value.startsWith('/') ? channel.commandCompletions(value) : []
   const overlayOpen =
     suggestions.length > 0 &&
     !helpOpen &&
@@ -355,8 +382,20 @@ export function PromptInput({
   }
 
   const setInput = (next: string, cursorOffset = next.length) => {
+    valueRef.current = next
+    cursorRef.current = Math.max(0, Math.min(cursorOffset, next.length))
     setValue(next)
-    setCursor(Math.max(0, Math.min(cursorOffset, next.length)))
+    setCursor(cursorRef.current)
+  }
+
+  /** Clipboard reads are asynchronous; insert against the latest render so
+   * typing while PowerShell owns the clipboard never gets overwritten. */
+  const insertClipboardAtCaret = (text: string) => {
+    const current = valueRef.current
+    const position = cursorRef.current
+    setInput(current.slice(0, position) + text + current.slice(position), position + text.length)
+    setSelectedCommand(0)
+    setFileSelected(0)
   }
 
   /** Line index of the cursor; -1 when the cursor is at the very end. */
@@ -373,6 +412,10 @@ export function PromptInput({
 
   useInput((input, key, event) => {
     if (selectionActive) return
+    // The editor round-trip ends by resuming stdin one microtask before the
+    // outcome lands — drop any key squeezed into that gap so the prompt's
+    // setValue can never overwrite fresh typing (and vice versa).
+    if (editorBusyRef.current) return
 
     /** Insert text at the caret (typing, paste) and dismiss overlays. */
     const insertAtCaret = (text: string) => {
@@ -393,24 +436,101 @@ export function PromptInput({
     }
 
     // Ctrl+V / Cmd+V: raw mode hands the key to the app, so the clipboard is
-    // read here — text, or file paths when Explorer copied files (pasted
-    // files insert their paths).
+    // read here — text, file paths when the file manager copied files, or an
+    // exported temp-file path when the clipboard holds a raw image.
     if (isMod(key) && input === 'v') {
       if (clipboardBusyRef.current) return
+      // Match insertAtCaret's overlay/selection dismissal up front: the
+      // async continuation below only sets value/cursor, so a paste landing
+      // while the help overlay is open would otherwise insert behind it.
+      if (helpOpen) onToggleHelp()
+      setSelectedCommand(0)
+      setFileSelected(0)
       clipboardBusyRef.current = true
-      void readClipboard().then(content => {
-        clipboardBusyRef.current = false
-        if (content === null) {
-          channel.notify(t('input-clipboard-empty'), { color: 'warning' })
-          return
+      void readClipboard()
+        .then(async content => {
+          if (content === null) {
+            channel.notify(t('input-clipboard-empty'), { color: 'warning' })
+            return
+          }
+          if (content.kind === 'unavailable') {
+            channel.notify(t('input-clipboard-unavailable'), { color: 'warning' })
+            return
+          }
+          if (content.kind === 'image') {
+            const mediaType = clipboardImageMediaType(content.path)
+            if (mediaType !== undefined) {
+              try {
+                const token = await channel.stageImage({
+                  data: new Uint8Array(await readFile(content.path)),
+                  mediaType,
+                  name: basename(content.path),
+                })
+                await unlink(content.path).catch(() => undefined)
+                insertClipboardAtCaret(`${token} `)
+                channel.notify(t('input-image-pasted', { token }), { timeoutMs: 2500 })
+                return
+              } catch (error: unknown) {
+                const message = error instanceof Error ? error.message : String(error)
+                channel.notify(t('input-image-paste-failed', { err: message }), { color: 'warning', timeoutMs: 5000 })
+              }
+            }
+          }
+          // Insert against the LIVE input state: the read above resolved
+          // asynchronously and the user may have typed while waiting.
+          const text = formatClipboardInsert(content)
+          const live = liveInputRef.current
+          const caret = Math.min(live.cursor, live.value.length)
+          setValue(live.value.slice(0, caret) + text + live.value.slice(caret))
+          setCursor(caret + text.length)
+        })
+        .catch(() => {
+          channel.notify(t('input-clipboard-read-failed'), { color: 'warning' })
+        })
+        .finally(() => {
+          // A rejected read must never wedge Ctrl+V for the rest of the
+          // session.
+          clipboardBusyRef.current = false
+        })
+      return
+    }
+
+    // Ctrl+X / Cmd+X: edit the current draft in $VISUAL/$EDITOR (issue #123,
+    // readline's edit-and-execute-command). The draft is written to a temp
+    // file, the terminal is handed to the editor (Ink's alt-screen handoff),
+    // and the saved text replaces the input when it differs. The util maps
+    // every failure to an outcome, but the catch/finally here is the hard
+    // guarantee: a rejected promise must never kill the process, and the
+    // busy flag must always clear or Ctrl+X stays locked forever.
+    if (isMod(key) && input === 'x') {
+      editorBusyRef.current = true
+      void (async () => {
+        try {
+          const outcome = await editInExternalEditor(value)
+          if (outcome.kind === 'edited') {
+            setValue(outcome.text)
+            setCursor(outcome.text.length)
+            setSelectedCommand(0)
+            setFileSelected(0)
+          } else if (outcome.kind === 'unavailable') {
+            channel.notify(t('input-editor-unavailable'), { color: 'warning' })
+          } else if (outcome.kind === 'failed') {
+            channel.notify(t('input-editor-failed', { name: outcome.message }), {
+              color: 'warning',
+            })
+          }
+        } catch {
+          channel.notify(t('input-editor-failed', { name: 'unknown' }), {
+            color: 'warning',
+          })
+        } finally {
+          editorBusyRef.current = false
         }
-        insertAtCaret(formatClipboardInsert(content))
-      })
+      })()
       return
     }
 
     /**
-     * Unified Enter semantics (both the parsed `return` key and the raw
      * CR/LF line from Windows cmd pipelines):
      * - command menu open → run the SELECTED command (never send `/mo`);
      * - model working → STEER into the running turn (next step boundary,
@@ -427,7 +547,7 @@ export function PromptInput({
       if (overlayOpen) {
         const command = suggestions[selectedCommand]
         if (command) {
-          tryRunCommand(`/${command.name}`)
+          tryRunCommand(command.commandLine)
           return
         }
       }
@@ -467,9 +587,9 @@ export function PromptInput({
       }
       const line = (value + input).trim()
       if (line.startsWith('/')) {
-        const matches = filterCommands(line, channel.commandList)
+        const matches = channel.commandCompletions(line)
         if (matches.length === 1) {
-          tryRunCommand(`/${matches[0]!.name}`)
+          tryRunCommand(matches[0]!.commandLine)
           return
         }
       }
@@ -513,7 +633,7 @@ export function PromptInput({
     }
     if (key.tab && overlayOpen) {
       const command = suggestions[selectedCommand]
-      if (command) setInput(`/${command.name} `)
+      if (command) setInput(command.replacement)
       return
     }
     // Tab while the model is working = queue for AFTER the turn (followup),
@@ -593,22 +713,23 @@ export function PromptInput({
       setCursor(entry.length)
       return
     }
-    if (key.leftArrow) {
-      setCursor(previous => Math.max(0, previous - 1))
-      return
-    }
-    if (key.rightArrow) {
-      setCursor(previous => Math.min(value.length, previous + 1))
-      return
-    }
     if (isMod(key) && key.leftArrow) {
-      // Jump to the previous word boundary (readline alt+b).
+      // Jump to the previous word boundary (readline alt+b). Must precede the
+      // bare-arrow arms: Ctrl+Left arrives as leftArrow + ctrl.
       setCursor(previous => wordBoundaryLeft(value, previous))
       return
     }
     if (isMod(key) && key.rightArrow) {
       // Jump to the next word boundary (readline alt+f).
       setCursor(previous => wordBoundaryRight(value, previous))
+      return
+    }
+    if (key.leftArrow) {
+      setCursor(previous => Math.max(0, previous - 1))
+      return
+    }
+    if (key.rightArrow) {
+      setCursor(previous => Math.min(value.length, previous + 1))
       return
     }
     if (key.backspace) {
@@ -825,8 +946,73 @@ export function PromptInput({
     active: !selectionActive,
   })
 
+  // 浮层整体挂载条件：与内部面板可见条件精确同值。关闭时必须把整个
+  // absolute 浮层移除——渲染器的 absolute-removed 检测只看被移除节点自身
+  // 的 style.position，常驻浮层 + 移除普通子节点不会触发 blit 解毒，被
+  // 覆盖的转录行会留空（见 Chat.tsx dialogOverlayOpen 注释）。
+  const floatersOpen = helpOpen || channel.pending.length > 0 || fileOverlayOpen || overlayOpen
+
   return (
     <Box flexDirection="column" marginTop={1}>
+      {/* 瞬态面板浮层（帮助/队列/补全）：零布局高度、向上覆盖转录尾部，
+          帧高不随面板开关涨落——否则帧顶行会被滚进 scrollback 并在关闭
+          重绘时二次写入（/model 切换多一份启动画的根因，见 OverlayAbove）。 */}
+      {floatersOpen && (
+      <OverlayAbove maxHeight={Math.max(terminalRows - 6, 4)}>
+        {helpOpen && (
+          <Box marginBottom={1}>
+            <HelpMenu commands={channel.commandList} />
+          </Box>
+        )}
+        {channel.pending.length > 0 && (
+          <Box flexDirection="column" paddingLeft={2} paddingBottom={1}>
+            {channel.pending.some(item => item.placement === 'steer') && (
+              <Box flexDirection="column">
+                <Text dimColor>⚡ {t('input-pending-steer-label')}</Text>
+                {channel.pending
+                  .filter(item => item.placement === 'steer')
+                  .map(item => (
+                    <Text key={item.id} dimColor wrap="truncate">
+                      {'  '}↳ {item.text}
+                    </Text>
+                  ))}
+              </Box>
+            )}
+            {channel.pending.some(item => item.placement === 'followup') && (
+              <Box flexDirection="column">
+                <Text dimColor>⏳ {t('input-pending-queue-label')}</Text>
+                {channel.pending
+                  .filter(item => item.placement === 'followup')
+                  .map(item => (
+                    <Text key={item.id} dimColor wrap="truncate">
+                      {'  '}↳ {item.text}
+                    </Text>
+                  ))}
+              </Box>
+            )}
+            <Text dimColor>Alt+↑ {t('input-pending-actions-hint')}</Text>
+          </Box>
+        )}
+        {fileOverlayOpen && (
+          <Box paddingLeft={2} paddingBottom={1}>
+            <FileSuggestions
+              files={fileMatches}
+              selectedIndex={fileSelected}
+              columns={columns}
+            />
+          </Box>
+        )}
+        {overlayOpen && (
+          <Box paddingLeft={2} paddingBottom={1}>
+            <CommandSuggestions
+              commands={suggestions}
+              selectedIndex={selectedCommand}
+              columns={columns}
+            />
+          </Box>
+        )}
+      </OverlayAbove>
+      )}
       {lastNotification && (
         // position=absolute takes zero layout height so the transcript never
         // shifts when a notification appears/disappears; the layer floats one
@@ -851,58 +1037,6 @@ export function PromptInput({
               {lastNotification.text}
             </Text>
           </Box>
-        </Box>
-      )}
-      {helpOpen && (
-        <Box marginBottom={1}>
-          <HelpMenu commands={channel.commandList} />
-        </Box>
-      )}
-      {channel.pending.length > 0 && (
-        <Box flexDirection="column" paddingLeft={2} paddingBottom={1}>
-          {channel.pending.some(item => item.placement === 'steer') && (
-            <Box flexDirection="column">
-              <Text dimColor>⚡ {t('input-pending-steer-label')}</Text>
-              {channel.pending
-                .filter(item => item.placement === 'steer')
-                .map(item => (
-                  <Text key={item.id} dimColor wrap="truncate">
-                    {'  '}↳ {item.text}
-                  </Text>
-                ))}
-            </Box>
-          )}
-          {channel.pending.some(item => item.placement === 'followup') && (
-            <Box flexDirection="column">
-              <Text dimColor>⏳ {t('input-pending-queue-label')}</Text>
-              {channel.pending
-                .filter(item => item.placement === 'followup')
-                .map(item => (
-                  <Text key={item.id} dimColor wrap="truncate">
-                    {'  '}↳ {item.text}
-                  </Text>
-                ))}
-            </Box>
-          )}
-          <Text dimColor>Alt+↑ {t('input-pending-actions-hint')}</Text>
-        </Box>
-      )}
-      {fileOverlayOpen && (
-        <Box paddingLeft={2} paddingBottom={1}>
-          <FileSuggestions
-            files={fileMatches}
-            selectedIndex={fileSelected}
-            columns={columns}
-          />
-        </Box>
-      )}
-      {overlayOpen && (
-        <Box paddingLeft={2} paddingBottom={1}>
-          <CommandSuggestions
-            commands={suggestions}
-            selectedIndex={selectedCommand}
-            columns={columns}
-          />
         </Box>
       )}
       <Box

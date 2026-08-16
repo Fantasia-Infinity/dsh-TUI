@@ -24,6 +24,7 @@ Cordis profile
 | `src/index.ts` | Cordis 插件名称、注入声明、配置接口与 Schema；保持入口轻量并延迟加载 runtime |
 | `src/plugin.ts` | TTY 检查、问卷与 Skills 注册、Agent 创建/恢复、React 挂载、统一退出清理 |
 | `src/channel.ts` | 将 DSH 持久化事件投影为 transcript；提供 submit、steer、resume、rewind、model/preset 等动作 |
+| `src/workspaces.ts` | 本地路径 fallback 与通用工作区 provider registry；不得包含任何 provider 的协议、文案或依赖 |
 | `src/screens/Chat.tsx` | modal 优先级、全局按键、滚动/搜索/选择状态、slash command 分发 |
 | `src/components/` | 用户界面和 design-system；不直接拥有 Agent 或 session 真相 |
 | `src/ui.ts` | 主题化 `Box`/`Text`、render、选择、滚动等公共 facade |
@@ -33,6 +34,10 @@ Cordis profile
 
 不要在组件中复制 DSH Agent、session 或 tool 服务。需要新能力时，优先通过已有
 service、registry 或 channel seam 接入。
+
+工作区扩展遵循单向依赖：TUI 只发布结构化 provider 接口，可选插件注册 URI、展示
+信息和命令执行器。协议解析与外部连接全部属于插件；删除插件后，本地工作区和会话
+路径不应出现缺失配置、占位文案或降级分支。
 
 ## Session 是真源
 
@@ -74,7 +79,8 @@ stdout 打印诊断；使用 stderr 的 `DSH_TUI_DEBUG` 或 `DSH_TUI_RENDER_LOG`
 
 | 路径 | 内容 |
 | --- | --- |
-| `~/.dsh-tui/sessions.sqlite` | profile patch 默认的 DSH SQLite 会话事件 |
+| `~/.dsh/sessions/` | profile patch 默认的共享 JSONL 会话事件（TUI / Web） |
+| `~/.dsh-tui/sessions/` | 直接运行 `cordis.yml` 时的 JSONL 会话事件 |
 | `~/.dsh-tui/resume.txt` | Windows 启动器和退出提示使用的最近 session ID |
 | `~/.dsh-tui/last-used.json` | `/resume` 最近使用排序元数据 |
 | `~/.dsh-tui/theme.json` | 当前主题选择 |
@@ -82,9 +88,10 @@ stdout 打印诊断；使用 stderr 的 `DSH_TUI_DEBUG` 或 `DSH_TUI_RENDER_LOG`
 | `~/.dsh-tui/working-activity.json` | 工作状态动画选择 |
 | `~/.dsh-tui/agent-preset.json` | 新会话默认 Agent preset |
 
-profile 可通过 `DSH_TUI_SESSION_ROOT` 改写 SQLite 路径；直接运行根目录的
-`cordis.yml` 时，该变量改写的是 JSONL 根目录（默认 `$DSH_HOME/sessions`，即
-`~/.dsh/sessions/`）。偏好文件是可选状态：损坏或缺失时回退，不应阻止 TUI 启动。
+`DSH_TUI_SESSION_ROOT` 在两种组合中都改写 JSONL 根目录。profile 默认使用
+`$DSH_HOME/sessions`（通常为 `~/.dsh/sessions/`）；直接运行根目录的
+`cordis.yml` 时默认使用 `~/.dsh-tui/sessions/`。偏好文件是可选状态：损坏或
+缺失时回退，不应阻止 TUI 启动。
 
 数据目录已从 `~/.dsh-cc` 更名为 `~/.dsh-tui`：首次启动时若旧目录存在而新目录
 不存在，会整体复制（不移动）到新目录并提示一行，旧目录保留由用户自行删除。
@@ -95,7 +102,8 @@ profile 可通过 `DSH_TUI_SESSION_ROOT` 改写 SQLite 路径；直接运行根�
 `dsh-TUI` 本身不提供独立沙箱；实际能力由 `cordis.patch.yml` 挂载的 DSH 服务
 决定。审批走 `ctx.approval` seam：策略为 `ask` 时 TUI 以 CC 式审批面板作为
 answerer（`approval/request` waterfall），仅允许一次/拒绝两种决定——协议没有
-"总是允许"与反馈通道：
+"总是允许"与反馈通道；`/permission` 预设切换来自 dsh-base 的
+`permission-presets` 服务行：
 
 - 非 Windows 默认 `DSH_PERMISSION_MODE` 为 `workspace-write`，文件策略要求先观察
   文件，审批策略通常为 `ask`。
@@ -113,8 +121,11 @@ answerer（`approval/request` waterfall），仅允许一次/拒绝两种决定�
 - 注入到 system prompt 的插件上下文不会在 UI 中单独列出，而是计入 system/context
   分段。
 - `/model` 通过 session fork 切换，不是原位修改；旧会话会留在 `/resume`。
-- Windows `Ctrl+V` 依赖 PowerShell `Get-Clipboard`；剪贴板被其他程序锁定时可能静默
-  失败并显示为空。
+- `Ctrl+V` 读剪贴板按平台分派：Windows 用 PowerShell `Get-Clipboard`（剪贴板被
+  其他程序锁定时重试后可能静默失败并显示为空）；macOS 用 `osascript`/`pbpaste`；
+  Linux/Unix 按会话顺序尝试 `wl-paste`/`xclip`/`xsel`（工具缺失跳过、会话
+  不可连接回退下一个，全部不可用时粘贴报"无可用剪贴板工具"）。剪贴板图片
+  导出为临时文件插入路径（0700 私有目录、0600 文件），不内嵌图片块。
 - 退出路径优先恢复终端并结束进程，不等待 Agent 异步落盘；持久化插件负责兜底。
 - 工具级审批面板已实现（approval 服务 + TUI answerer）；`/permission` 的沙箱
   预设切换由 dsh-base 的 `permission-presets` 插件提供，profile 组合下可用；
