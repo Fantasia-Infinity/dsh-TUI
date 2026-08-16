@@ -79,6 +79,12 @@ commands), then `dsh-tui` and `dsh --profile dsh-tui` are equivalent.
 `dsh-tui --resume` restores the most recently selected session; on Windows
 the repository's `dsh-tui.cmd` works the same way.
 
+For running dsh-TUI inside VS Code — directly in the integrated terminal or
+via the `dsh-tui-vscode` companion extension (real-integrated-terminal
+sessions, an experience almost identical to the official Claude Code
+extension; available on the VS Code Marketplace) — see
+[Running dsh-TUI in VS Code](docs/vscode.en.md).
+
 See [Getting started](docs/getting-started.en.md) for profile composition,
 source builds, and troubleshooting.
 
@@ -138,7 +144,7 @@ so keep using `Ctrl`.
 
 | Group | Commands |
 |---|---|
-| Session | `/new` new session · `/resume` switch sessions in the current workspace · `/rename` rename session · `/workspace resume|rename|open` manage workspaces · `/clear` clear screen · `/compact` compact · `/export` export Markdown · `/trace` trace timeline |
+| Session | `/new` new session · `/resume` session browser (search, preview, cross-project, sub-agent runs folded) · `/rename` rename session · `/workspace resume|rename|open` manage workspaces · `/clear` clear screen · `/compact` compact · `/export` export Markdown · `/trace` trace timeline |
 | Status | `/status` session info · `/cost` token usage · `/doctor` environment self-check · `/config` configuration sources · `/init` create AGENTS.md |
 | Model | `/model` picker · `/thinking` thinking display · `/tokens` token details · `/theme` theme picker · `/lang` zh/en UI switch |
 | Accounts/Policy | `/provider` add a model provider · `/login` credential status · `/logout` logout notes · `/permissions` permission notes · `/add-dir` file-policy scope · `/hooks` · `/mcp` · `/memory` |
@@ -155,6 +161,7 @@ so keep using `Ctrl`.
 | [Themes](docs/themes.en.md) | Built-in themes, background detection, custom JSON themes, validation |
 | [Interaction and commands](docs/interaction.en.md) | Keyboard, mouse, questionnaires, slash commands, session workflows |
 | [Architecture and limitations](docs/architecture.en.md) | Runtime path, rendering, persistence, security boundary, known limitations |
+| [VS Code guide](docs/vscode.en.md) | Running dsh-tui in the VS Code integrated terminal; the `dsh-tui-vscode` companion extension offers an experience almost identical to the official Claude Code extension (on the Marketplace) |
 | [Contributing](docs/contributing.en.md) | Contribution workflow, repository map, build artifacts, verification matrix, change rules |
 | [Plugin development](docs/plugins.en.md) | Plugin seams (session events / slots / skills / themes / prompt sections), contract, conventions, listing |
 
@@ -163,6 +170,7 @@ The complete bilingual index is [`docs/README.md`](docs/README.md).
 ## Configuration & Extensions
 
 - **Agent presets**: four official agent modes (`standard` / `code` / `minimal` / `cordis`)
+  plus the TUI-bundled Liangshen mode (`liangshen`),
   switched with `/preset`; sessions that already have a conversation cannot switch, while
   blank sessions take effect immediately. The default preset persists in
   `~/.dsh-tui/agent-preset.json`; `/model` selections persist in `~/.dsh-tui/model.json`.
@@ -266,9 +274,10 @@ pnpm build
 pnpm smoke
 ```
 
-`pnpm build` compiles `src/` into the checked-in `lib/types/` output. Source
-changes must include regenerated artifacts, and rendering, questionnaire, or
-tool-card changes require the relevant regression scripts.
+`lib/types/` is ignored generated output. `pnpm build` recompiles it from a
+clean output directory and runs the build gates. npm Git URL installs generate
+the same runtime through `prepare`. Rendering, questionnaire, or tool-card
+changes also require the relevant regression scripts.
 
 ## Plugin Ecosystem
 
