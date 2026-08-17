@@ -33,6 +33,12 @@
   <img src="screenshots/wechat-official.png" alt="DeepSeek Harness 官方公众号推文收录 dsh-TUI" width="560">
 </p>
 
+同时也被 [dshfind](https://dshfind.com/ccch1mneyyy/dsh-TUI) 插件目录收录：
+
+<p align="center">
+  <a href="https://dshfind.com/ccch1mneyyy/dsh-TUI"><img src="https://dshfind.com/api/card/ccch1mneyyy/dsh-TUI?lang=zh" alt="dsh-TUI on dshfind"></a>
+</p>
+
 ## 核心能力
 
   - **终端原生交互**：流式 Markdown、结构化工具卡、命令与文件补全、`@` 文件引用
@@ -138,7 +144,7 @@ macOS 自带 Terminal.app 会自行消费 `⌘` 快捷键，请继续使用 `Ctr
 | 会话 | `/new` 新会话 · `/resume` 会话浏览器（搜索、预览、跨项目、折叠子 agent 运行） · `/rename` 重命名会话 · `/workspace resume|rename|open` 管理工作区 · `/clear` 清屏 · `/compact` 压缩 · `/export` 导出 Markdown · `/trace` 轨迹场景（亦可 `Ctrl+T`） |
 | 状态 | `/status` 会话信息 · `/cost` token 用量 · `/doctor` 环境自检 · `/config` 配置来源 · `/init` 创建 AGENTS.md |
 | 模型 | `/model` 选择器 · `/thinking` 思考显示 · `/tokens` token 明细 · `/theme` 主题选择器 · `/lang` 中英界面切换 |
-| 账号/策略 | `/provider` 添加模型提供方 · `/login` 凭证状态 · `/logout` 登出说明 · `/permissions` 权限说明 · `/add-dir` 文件策略范围 · `/hooks` · `/mcp` · `/memory` |
+| 账号/策略 | `/provider` 添加模型提供方 · `/login` 凭证状态 · `/logout` 登出说明 · `/permissions` 权限说明 · `/add-dir` 文件策略范围 · `/hooks` · `/mcp` |
 | 技能 | `/audit` 代码审计 · `/bug` bug 报告 · `/review` 代码评审 · `/practice` 编程练习 · `/pr_comments` PR 评论 · `/release-notes` 发布说明 · `/vuln-check` 漏洞检查 |
 | 其它 | `/agents` 子代理列表 · `/update` 自动更新并重启 · `/vim` · `/terminal-setup` · `/connect` · `/help` · `/exit` |
 | 注册表 | `/plan` `/goal`（DSH 命令注册表插件，随插件自动并入 `/` 菜单） |
@@ -207,7 +213,7 @@ compaction 和持久化继续由 DSH 服务拥有。更详细的模块边界与�
 - **TPS 仪表**：参考 pi-tps-meter——流式 1/8 格 gauge、历史 min-max sparkline、
   速度语义色（≥50 绿 / ≥20 黄 / <20 红）。
 - **working-activity 生态**：工作状态行复用
-  [dsh-working-activity](https://github.com/ccch1mneyyy/dsh-working-activity)
+  [dsh-working-activity](https://github.com/ccch1mneyyy/working-activity)
   的纯状态机，在进程内从基础会话事件派生，不向共享日志写入 UI 状态。
 - **终端粘贴**：raw 模式下 Ctrl+V 由应用接管，按平台读取系统剪贴板——Windows
   走 PowerShell `Get-Clipboard`，macOS 走 `osascript`/`pbpaste`，Linux 自动探测
@@ -231,7 +237,7 @@ compaction 和持久化继续由 DSH 服务拥有。更详细的模块边界与�
   权限提升命令会弹出审批条。`/permission` 预设切换由 dsh-base 的
   `permission-presets` 插件提供，profile 组合默认可用；裸组合 `cordis.yml`
   未挂载该插件（无 `/permission` 命令）。
-- `/vim` `/connect` `/hooks` `/memory` 为 CC 同名占位：对应能力在 DSH 侧无等价
+- `/vim` `/connect` `/hooks` 为 CC 同名占位：对应能力在 DSH 侧无等价
   机制，命令会给出明确说明而非静默。
 
 完整已知限制与安全边界见[架构与限制](docs/architecture.md)。

@@ -75,6 +75,7 @@ export const LOCAL_COMMANDS: LocalCommand[] = [
   { name: 'status', description: 'Show session status' },
   { name: 'cost', description: 'Show session token usage' },
   { name: 'config', description: 'Show the dsh-tui configuration source' },
+  { name: 'settings', description: 'View and edit plugin settings' },
   { name: 'doctor', description: 'Run environment checks' },
   { name: 'init', description: 'Create AGENTS.md in the working directory' },
   { name: 'agents', description: 'Show subagents of this session' },
@@ -95,7 +96,7 @@ export const LOCAL_COMMANDS: LocalCommand[] = [
   { name: 'add-dir', description: 'Show the filesystem policy scope' },
   { name: 'hooks', description: 'Show hooks status' },
   { name: 'mcp', description: 'Show MCP status' },
-  { name: 'memory', description: 'Show memory status' },
+  { name: 'skills', description: 'List available skills' },
   { name: 'update', description: 'Update dsh-tui and restart' },
   // Built-in skills (CC's skill commands, driven through DSH skills)
   { name: 'audit', description: 'Run a comprehensive code audit on this project' },

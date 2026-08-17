@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify generated output is not checked in
+        run: test -z "$(git ls-files -- lib)"
+
       - uses: pnpm/action-setup@v4
         with:
           version: 11
@@ -54,6 +57,7 @@ jobs:
       - run: node --import tsx/esm scripts/verify-askpanel-layout.tsx
 
       - run: node --import tsx/esm scripts/repro-toolcards.tsx
+      - run: node --import tsx/esm scripts/repro-diff-split.tsx
 
       # 滚动/pill/内联模式回归：新消息 pill 计数递减、Ctrl+C 交互、
       # 内联 scrollback 第三方终端适配。曾因 mock channel 缺新字段而
@@ -61,6 +65,9 @@ jobs:
       # 整个 0.6.x 才被发现——挂进来防再烂。
       - run: node --import tsx/esm scripts/repro-pill.tsx
       - run: node --import tsx/esm scripts/repro-ctrlc.tsx
+      # /settings 设置屏回归（issue #165）：开屏、staged 编辑、revision 栅栏
+      # 保存、密钥走 credentials、Esc 返回会话。
+      - run: node --import tsx/esm scripts/repro-settings.tsx
       - run: node --import tsx/esm scripts/repro-inline-scrollback.tsx
       - run: node --import tsx/esm scripts/repro-inline-thirdparty.tsx
 
@@ -71,6 +78,13 @@ jobs:
           NODE_ENV: production
       - run: node scripts/verify-scroll.mjs
       - run: node scripts/verify-shrink.mjs
+
+      # unseen-count 上报契约回归：同值重复上报会在密集流式 commit 下把
+      # setState 派发进 commit 内，嵌套更新计数连涨越过 React #185 上限
+      # （#146 之后残留的活链）。只在计数变化时才允许上报。
+      - run: node --import tsx/esm scripts/verify-unseen-report-once.tsx
+        env:
+          NODE_ENV: production
 
       # /model 切换 scrollback 重复沉积回归：瞬态面板（补全/picker）必须
       # 走零高度浮层，帧高不随开关涨落——否则帧顶行滚进 scrollback 后被
@@ -169,6 +183,9 @@ jobs:
       # leftArrow+ctrl 到达，isMod 跳词分支必须先于裸方向键分支；
       # 真实管线喂 ESC[1;5D/1;5C 移动光标插入标记字符后提交校验全文。
       - run: node scripts/verify-word-jump.mjs
+      # stdin 批量按键回归：同一读取内的文本、方向键、文本必须依次基于
+      # 前一事件的输入状态执行，不能因 React 批处理读取旧闭包而丢字符。
+      - run: node scripts/verify-batched-prompt-input.mjs
       # /resume 会话管理回归（issue #112）：picker 重命名追加帧（seq 连续、
       # 已有字节不动、last-title-wins）、删除目录、路径穿越 id 拒绝。
       - run: node scripts/verify-resume-manage.mjs
@@ -208,6 +225,11 @@ jobs:
       - run: node --import tsx/esm scripts/verify-compact.mjs
 
       - run: node --import tsx/esm scripts/verify-channel-goal-todo.mjs
+
+      # 裸 ● 空行回归：纯思考/纯工具步骤（无文本块）的 assistant/message
+      # 不得创建空 assistant 行，否则思考块折叠后转录里多出一个只有
+      # ● 前缀、内容为空的行。
+      - run: node scripts/verify-empty-assistant-row.mjs
 
       # 技能斜杠命令补全回归（issue #86）：user-invocable 技能合并进 /
       # 菜单与 Tab 补全（skill 标记、与 locals/注册表撞名让位），
@@ -309,3 +331,11 @@ jobs:
       # 提问面板 hideCustomInput 行为回归：纯选择题隐藏输入行且 Tab/打字
       # 不劫持焦点，纯文本题忽略 hide 标记，多选题默认行为不回退。
       - run: node --import tsx/esm scripts/verify-askpanel-hide-custom-input.tsx
+
+      # 长问卷列表回归：24 行终端中的 36 个两行 provider 选项必须围绕
+      # focusIndex 窗口化，初始和深度导航后焦点 label/单选标记始终可见。
+      - run: node --import tsx/esm scripts/verify-askpanel-long-list.tsx
+
+      # 插件场景渲染崩溃边界：Thrower 场景必须被 PluginSceneBoundary 接住——
+      # onError 精确一次、崩溃场景停止绘制、进程存活；健康场景不受影响。
+      - run: node --import tsx/esm scripts/verify-plugin-scene-boundary.tsx

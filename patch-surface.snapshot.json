@@ -6,6 +6,8 @@
     "workspace",
     "dsh-tui-workspaces",
     "dsh-tui-command-trees",
+    "dsh-tui-settings-sections",
+    "dsh-tui-scenes",
     "agent-presets",
     "cordis-host-runner",
     "dsh-tui",

@@ -1,12 +1,13 @@
 import React from 'react'
 import { t, getLang, setLang, isLang, writeLangPref, subscribeLang, type I18nKey } from '../i18n.js'
 import { AlternateScreen, Box, Text, useInput, ScrollBox, type ScrollBoxHandle, useTheme, useTerminalSize } from '../ui.js'
+import * as tuiKit from '../ui.js'
 import { POINTER } from '../cc/figures.js'
 import { isMod, isPlainReturnInput, modLabel } from '../utils/modifiers.js'
 import { formatTokens } from '../cc/format.js'
 import { homeDir } from '../utils/paths.js'
 import type { LlmModelInfo } from '../dsh-adapter/types.js'
-import { sessionCwdMatches, type Channel, type ChatRow, type EffortOption, type PresetOption } from '../dsh-adapter/channel.js'
+import { sessionCwdMatches, type Channel, type ChatRow, type EffortOption, type PresetOption, type SkillInfo } from '../dsh-adapter/channel.js'
 import type { QuestionStore } from '../dsh-adapter/questions.js'
 import { runProviderWizard } from '../dsh-adapter/providerWizard.js'
 import { ApprovalStore } from '../dsh-adapter/approvals.js'
@@ -28,7 +29,10 @@ import { StatusLine } from './StatusLine.js'
 import { WorkingSpinner, useThinkingStatus } from '../components/WorkingSpinner.js'
 import { ActivityLine, contextPressurePct } from '../components/ActivityLine.js'
 import { ModelPicker } from '../components/ModelPicker.js'
+import { PluginSceneBoundary } from '../components/PluginSceneBoundary.js'
+import { SkillsPicker, SkillsPickerLoading } from '../components/SkillsPicker.js'
 import { SessionBrowser } from './SessionBrowser.js'
+import { Settings } from './Settings.js'
 import { WorkspacePicker } from '../components/WorkspacePicker.js'
 import { WorkspaceFlowPicker } from '../components/WorkspaceFlowPicker.js'
 import type { TuiWorkspaceCommandResult, TuiWorkspaceTarget } from '../workspaces.js'
@@ -211,9 +215,17 @@ export function Chat({
   const [modelPickerOpen, setModelPickerOpen] = React.useState(false)
   const [models, setModels] = React.useState<readonly LlmModelInfo[]>([])
   const [modelIndex, setModelIndex] = React.useState(0)
+  /** `/skills` 技能目录（issue #204）：null = 注册表快照在途。 */
+  const [skillsPickerOpen, setSkillsPickerOpen] = React.useState(false)
+  const [skillsList, setSkillsList] = React.useState<readonly SkillInfo[] | null>(null)
+  const [skillsIndex, setSkillsIndex] = React.useState(0)
   /** `/resume` opens the session browser, a screen rather than a panel. It
    *  owns its own selection, filters and keyboard — Chat only opens it. */
   const [browserOpen, setBrowserOpen] = React.useState(false)
+  /** `/settings` opens the plugin settings screen (issue #165) — like the
+   *  browser, a screen rather than a panel: it owns its own focus, staged
+   *  drafts and keyboard; Chat only opens it. */
+  const [settingsOpen, setSettingsOpen] = React.useState(false)
   const [workspacePickerOpen, setWorkspacePickerOpen] = React.useState(false)
   const [workspaceTargets, setWorkspaceTargets] = React.useState<readonly TuiWorkspaceTarget[]>([])
   const [workspaceIndex, setWorkspaceIndex] = React.useState(0)
@@ -382,10 +394,17 @@ export function Chat({
   // Spinner timing refs, fed from channel state each render (the spinner
   // only mounts while working, so values are stable for the mount).
   const responseLengthRef = React.useRef(0)
+  const uploadTokensRef = React.useRef(0)
   const loadingStartTimeRef = React.useRef(0)
   const totalPausedMsRef = React.useRef(0)
   const pauseStartTimeRef = React.useRef<number | null>(null)
   responseLengthRef.current = channel.responseChars
+  // Most recent request's real upload (input + cache read/write occupy the
+  // wire exactly like the context window); 0 until the first usage event.
+  const lastUploadTokens = channel.lastUsage === undefined
+    ? 0
+    : channel.lastUsage.input + channel.lastUsage.cacheRead + channel.lastUsage.cacheWrite
+  uploadTokensRef.current = lastUploadTokens
   loadingStartTimeRef.current = channel.turnStart
   const thinkingStatus = useThinkingStatus(channel.spinnerMode === 'thinking')
 
@@ -722,6 +741,23 @@ export function Chat({
           setModelIndex(index >= 0 ? index : 0)
         })
         return true
+      case 'skills':
+        // issue #204: 列出当前 agent 的完整技能目录（名称 + 来源 + 简述），
+        // Enter 把可直调技能以 `/name ` 填回输入行（completion-only 分发的
+        // 同一路径）。注册表读取走 channel（快照 scoped 到 live agent）。
+        setHelpOpen(false)
+        setSkillsList(null)
+        setSkillsIndex(0)
+        setSkillsPickerOpen(true)
+        void channel.listSkills().then((list) => {
+          if (list === undefined) {
+            setSkillsPickerOpen(false)
+            channel.notify(t('skills-load-failed'), { color: 'error' })
+            return
+          }
+          setSkillsList(list)
+        })
+        return true
       case 'provider': {
         // Interactive add-provider wizard (/provider): drives the shared
         // question panel, persists profile + key via the channel's settings/
@@ -870,6 +906,13 @@ export function Chat({
         channel.pushLocal('/cost', lines)
         return true
       }
+      case 'settings': {
+        // Plugin settings screen (issue #165): opens immediately; the screen
+        // reads sections + namespaces from the channel itself.
+        setHelpOpen(false)
+        setSettingsOpen(true)
+        return true
+      }
       case 'config': {
         const userHome = process.env.USERPROFILE ?? ''
         const lines = [
@@ -969,13 +1012,6 @@ export function Chat({
       case 'mcp':
         setHelpOpen(false)
         channel.pushLocal('/mcp', channel.mcpStatus())
-        return true
-      case 'memory':
-        setHelpOpen(false)
-        channel.pushLocal('/memory', [
-          t('memory-none'),
-          t('memory-hint'),
-        ])
         return true
       case 'update':
         setHelpOpen(false)
@@ -1283,6 +1319,14 @@ export function Chat({
     // so every key belongs to it — including the plain letters that drive its
     // search box, which Chat would otherwise route into the prompt.
     if (browserOpen) return
+    // Same for the settings screen: plain letters (s save / d discard) and
+    // the field draft editor belong to it alone.
+    if (settingsOpen) return
+    // A plugin scene (dsh-tui-scenes) or the trajectory scene owns the whole
+    // screen while open: every key belongs to it. Unguarded, an Esc meant to
+    // CLOSE the scene also reached the chat:cancel branch below whenever a
+    // turn was in flight — closing the view and killing the turn in one key.
+    if (sceneOpen || channel.pluginScene !== undefined) return
     // The questionnaire / approval panel owns the keyboard while one is
     // pending (the panel's own useInput handles ↑/↓/Space/Tab/Enter/Esc;
     // the prompt input is unmounted, so nothing else should see these keys).
@@ -1503,6 +1547,24 @@ export function Chat({
       }
       return
     }
+    if (skillsPickerOpen) {
+      const list = skillsList ?? []
+      if (key.upArrow) {
+        if (list.length > 0) setSkillsIndex(index => (index <= 0 ? list.length - 1 : index - 1))
+      } else if (key.downArrow) {
+        if (list.length > 0) setSkillsIndex(index => (index >= list.length - 1 ? 0 : index + 1))
+      } else if (plainReturn) {
+        const skill = list[skillsIndex]
+        setSkillsPickerOpen(false)
+        // 可直调技能 Enter 填入 `/name `——与 / 菜单选中技能同一条
+        // completion-only 分发路径；模型专用技能（userInvocable=false）只关闭。
+        // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty list
+        if (skill?.userInvocable) setHistoryFill(`/${skill.name} `)
+      } else if (key.escape) {
+        setSkillsPickerOpen(false)
+      }
+      return
+    }
     if (activityPickerOpen) {
       if (key.upArrow) {
         setActivityIndex(index => (index <= 0 ? PRESET_NAMES.length - 1 : index - 1))
@@ -1600,9 +1662,19 @@ export function Chat({
           setHistoryFocus(0)
         }
       } else if (key.leftArrow) {
-        setHistoryCursor(cursor => Math.max(0, cursor - 1))
+        // Step by code point, not UTF-16 unit: an emoji is two units, and
+        // a mid-pair caret offset would split it in the SearchBox render.
+        setHistoryCursor(cursor => {
+          if (cursor <= 0) return 0
+          const ch = [...historyQuery.slice(0, cursor)].pop()!
+          return cursor - ch.length
+        })
       } else if (key.rightArrow) {
-        setHistoryCursor(cursor => Math.min(historyQuery.length, cursor + 1))
+        setHistoryCursor(cursor => {
+          if (cursor >= historyQuery.length) return historyQuery.length
+          const ch = [...historyQuery.slice(cursor)][0]!
+          return cursor + ch.length
+        })
       } else if (key.home) {
         setHistoryCursor(0)
       } else if (key.end) {
@@ -1741,6 +1813,41 @@ export function Chat({
   // Working-activity line (spinner slot): context-pressure prefix shares the
   // StatusLine thresholds (amber ≥ 80, red ≥ 95).
   const activityWarnPct = contextPressurePct(channel.lastUsage, channel.contextWindow)
+
+  // A plugin scene (dsh-tui-scenes) takes the whole terminal the same way
+  // the trajectory scene does, and sits at the TOP of this return chain:
+  // an open() landing while the session browser or the trajectory scene is
+  // up must still take the screen (and the keyboard, via the useInput guard
+  // above), not queue silently behind them. Closing the plugin scene lands
+  // back on whatever screen was up before, so these early returns read as a
+  // stack. The component comes from the registry, so its identity is stable
+  // across renders and its hook state survives re-renders; it receives the
+  // TUI's own React + ui kit because a plugin importing its own React copy
+  // would die on the first hook call under this reconciler.
+  // The scene is third-party code, so it renders inside a boundary: a render
+  // crash reports to the transcript and closes the scene instead of taking
+  // the whole TUI down through ink's app-level boundary.
+  const pluginScene = channel.pluginScene
+  if (pluginScene !== undefined) {
+    const node = (
+      <PluginSceneBoundary
+        id={pluginScene.id}
+        onError={(id, error) => {
+          channel.notify(t('plugin-scene-crashed', { id, err: error.message }), { color: 'error' })
+          channel.closePluginScene()
+        }}
+      >
+        {React.createElement(pluginScene.component, {
+          React,
+          ui: tuiKit,
+          channel,
+          close: () => channel.closePluginScene(),
+        })}
+      </PluginSceneBoundary>
+    )
+    return fullscreen ? node : <AlternateScreen>{node}</AlternateScreen>
+  }
+
   // The browser is a screen, not an overlay: it REPLACES the conversation
   // rather than floating above it. Rendering it as an early return (after
   // every hook above has run) is what makes that literal — there is no
@@ -1759,9 +1866,17 @@ export function Chat({
     return fullscreen ? browser : <AlternateScreen>{browser}</AlternateScreen>
   }
 
+  // The settings screen follows the browser's rule exactly: it REPLACES the
+  // conversation (an early return after every hook above has run), so there
+  // is no transcript underneath to be repainted or bled through.
+  if (settingsOpen) {
+    const screen = <Settings channel={channel} onClose={() => setSettingsOpen(false)} />
+    return fullscreen ? screen : <AlternateScreen>{screen}</AlternateScreen>
+  }
+
   /** Prompt input is inert while a modal dialog owns the keyboard. */
   const promptSelectionActive =
-    selectionActive || modelPickerOpen || workspacePickerOpen || workspaceFlow !== null || activityPickerOpen ||
+    selectionActive || modelPickerOpen || skillsPickerOpen || workspacePickerOpen || workspaceFlow !== null || activityPickerOpen ||
     effortSliderOpen || presetPickerOpen || themePickerOpen || thinkingOpen || historyOpen || rewindOpen || searchOpen ||
     btw !== null
 
@@ -1785,7 +1900,7 @@ export function Chat({
   // blit-skip 后留空（Esc 关 picker 一片空白的根因）。
   const dialogOverlayOpen =
     thinkingOpen || (workspacePickerOpen && workspaceTargets.length > 0) || workspaceFlow !== null ||
-    modelPickerOpen ||
+    modelPickerOpen || skillsPickerOpen ||
     activityPickerOpen || (effortSliderOpen && effortOptions.length > 1) ||
     (presetPickerOpen && presetOptions.length > 0) || themePickerOpen || historyOpen ||
     rewindOpen || searchOpen
@@ -1829,6 +1944,7 @@ export function Chat({
           selectedId={selectionActive ? selectedId : null}
           onToggleRow={toggleRowExpanded}
           model={channel.model}
+          diffLayout={channel.diffLayout}
           showAll={showAllMessages}
           thinkingVisible={thinkingVisible}
           onToggleAll={() =>{  setShowAllMessages(previous => !previous) }}
@@ -1869,7 +1985,11 @@ export function Chat({
                   activityFrames={channel.activityFrames}
                   warnPct={activityWarnPct}
                   warnDanger={activityWarnPct !== undefined && activityWarnPct >= 95}
-                  suffix={` · ↓ ${channel.responseChars} tokens`}
+                  // Upload = real tokens of the last request; download =
+                  // the animated chars/4 estimate, matching the classic
+                  // spinner's counter (the suffix used raw chars before,
+                  // inflating the reading next to a real upload number).
+                  suffix={`${lastUploadTokens > 0 ? ` · ↑ ${formatTokens(lastUploadTokens)}` : ''} · ↓ ${formatTokens(Math.round(channel.responseChars / 4))} tokens`}
                 />
               </Box>
             ) : (
@@ -1877,6 +1997,7 @@ export function Chat({
                 mode={channel.spinnerMode}
                 hasActiveTools={channel.activeToolCount > 0}
                 responseLengthRef={responseLengthRef}
+                uploadTokensRef={uploadTokensRef}
                 loadingStartTimeRef={loadingStartTimeRef}
                 totalPausedMsRef={totalPausedMsRef}
                 pauseStartTimeRef={pauseStartTimeRef}
@@ -1984,6 +2105,18 @@ export function Chat({
                   models={models}
                   focusIndex={modelIndex}
                   currentModel={`${channel.provider}/${channel.model}`}
+                />
+              )}
+            </Box>
+          )}
+          {skillsPickerOpen && (
+            <Box flexDirection="column" marginTop={1}>
+              {skillsList === null ? (
+                <SkillsPickerLoading />
+              ) : (
+                <SkillsPicker
+                  skills={skillsList}
+                  focusIndex={skillsIndex}
                 />
               )}
             </Box>

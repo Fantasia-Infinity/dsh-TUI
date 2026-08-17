@@ -177,7 +177,48 @@ ctx.inject(['systemPrompt'], (promptCtx) => {
 注入的内容会进入每个请求的 system prompt（计入上下文/token），**默认影响
 KV 缓存稳定性**——非必要不要注入，注入也要保持文本完全稳定。
 
-## 接缝六：profile 组合（cordis.patch.yml）
+## 接缝六：插件设置区块（tuiSettingsSections）
+
+带配置命名空间的插件可以向 `/settings` 设置屏声明一个可编辑区块（issue #165）。
+契约是**声明式**的：插件只描述"哪些字段可编辑"，渲染、草稿编辑、保存/放弃、
+revision 冲突重试全部由 TUI 宿主负责；存储、schema 校验、分层解析仍在 dsh
+settings 服务（内核）侧——TUI 只做展示。
+
+```ts
+import type { TuiSettingsSection } from '@deepseek-harness-tui/dsh-tui/settings-sections'
+
+ctx.inject(['tuiSettingsSections'], (settingsCtx) => {
+  const unregister = settingsCtx.tuiSettingsSections.register({
+    ns: 'my-plugin',            // 与 ctx.settings.register 的命名空间一致
+    title: 'My plugin',         // 英文标题（也是回退文案）
+    descriptions: { zh: '我的插件' },
+    fields: [
+      { path: ['enabled'], label: 'Enabled', kind: 'boolean' },
+      { path: ['limit'], label: 'Retry limit', kind: 'number', hint: 'Attempts before giving up' },
+      { path: ['mode'], label: 'Mode', kind: 'select', options: [
+        { value: 'fast', label: 'Fast' },
+        { value: 'safe', label: 'Safe' },
+      ] },
+      // 密钥字段：永不过 settings 文档——空白草稿不写入，输入了才走 credentials 接缝
+      { path: ['apiKey'], label: 'API key', kind: 'text', secret: { ref: 'MY_PLUGIN_API_KEY' } },
+    ],
+  } satisfies TuiSettingsSection)
+  ctx.effect(() => () => unregister())
+})
+```
+
+语义（与 web 前端的插件设置卡片一致）：
+
+- 编辑是**草稿式**的：用户打字只改草稿，按 `s` 保存才落成一次 revision 栅栏的
+  `settings.mutate` path ops（冲突自动用新 revision 重试一次）。
+- 字段的"已覆盖"标记按 **user 层存在性**判断（值等于默认也算覆盖）；清空文本
+  字段会在保存时生成 `unset`，让字段回退到组合层。
+- `kind` 目前支持 `text` / `number` / `boolean` / `select`；复杂嵌套结构（dict/
+  数组编辑器）暂不支持，用户仍可手工编辑 `~/.dsh/settings.yaml`——未声明区块的
+  命名空间在设置屏里就是只读 + YAML 提示。
+- 命名空间未注册（插件未挂载 settings section）时区块显示为不可用，不报错。
+
+## 接缝七：profile 组合（cordis.patch.yml）
 
 插件包通过自己的 `cordis.patch.yml` 声明要在 profile 里插入/覆盖的行：
 
@@ -201,6 +242,126 @@ KV 缓存稳定性**——非必要不要注入，注入也要保持文本完全
   根，所以主包把自己的工作状态行插件以
   `@deepseek-harness-tui/dsh-tui/working-activity` 子路径再导出后挂载。你的插件
   如果也要被别的 bundle 组合，提供同样的显式子路径导出。
+
+## 接缝八：插件全屏场景（tuiScenes）
+
+插件可以把一个**整屏 React 场景**注册给 TUI，再从自己的 slash 命令里打开它——
+就是 `/trace`（轨迹时间线）和 `/settings` 那种"接管整个终端、退出后原样归还"
+的页面形态。命令执行权仍在 dsh-commands（`command/run`/`command/done` 日志对
+照记），TUI 只提供渲染面与键盘所有权；场景的打开/关闭不碰会话流，不落任何
+session 事件。
+
+### 三步接入
+
+**1. 注册场景**（`id` 全局唯一，kebab-case；重复或非法 id 注册即抛错）：
+
+```ts
+import type { TuiSceneProps } from '@deepseek-harness-tui/dsh-tui/scenes'
+
+ctx.inject(['tuiScenes'], (sceneCtx) => {
+  const dispose = sceneCtx.tuiScenes.register({
+    id: 'my-dashboard',
+    title: 'My dashboard',        // 可选，调试/日志用；标题栏由场景自绘
+    component: MyDashboard,
+  })
+  ctx.effect(() => () => dispose())   // dispose 当前打开的场景会自动关屏
+})
+```
+
+**2. 注册打开它的命令**（执行与日志仍归 dsh-commands；handler 返回静默
+`success`，转录里只留下命令本身的一行）：
+
+```ts
+ctx.inject(['commands'], (commandCtx) => {
+  const dispose = commandCtx.commands.register({
+    name: 'dashboard',
+    description: 'Open my dashboard',
+    handler: () => {
+      const opened = sceneCtx.tuiScenes.open('my-dashboard')
+      return opened
+        ? { kind: 'success' as const }
+        : { kind: 'error' as const, text: 'dashboard scene is not registered' }
+    },
+  })
+  ctx.effect(() => () => dispose())
+})
+```
+
+**3. 写场景组件**——props 注入宿主的 `React` 与 `ui` kit，**这是硬契约**
+（原因见下节）：
+
+```tsx
+// tsconfig: "jsx": "react-jsx",
+//           "jsxImportSource": "@deepseek-harness-tui/dsh-tui"
+import type { TuiSceneProps } from '@deepseek-harness-tui/dsh-tui/scenes'
+
+export function MyDashboard({ React, ui, channel, close }: TuiSceneProps) {
+  // hook 必须用注入的 React；JSX 经 jsxImportSource 走宿主 jsx-runtime
+  const { Box, Text, useInput, useTerminalSize } = ui
+  const { columns, rows } = useTerminalSize()
+  // channel 是响应式的：照 Chat 的用法订阅 version，数据随会话实时刷新
+  React.useSyncExternalStore(channel.subscribe, () => channel.version)
+  // 场景打开期间独占键盘——Esc/q 关闭这类约定由场景自己实现
+  useInput((input, key) => {
+    if (key.escape || input === 'q') close()
+  })
+  return (
+    <Box flexDirection="column" width="100%" paddingX={1}>
+      <Text bold>My dashboard</Text>
+      <Text>{channel.rows.length} rows · {columns}×{rows}</Text>
+    </Box>
+  )
+}
+```
+
+不用 JSX 也可以：`React.createElement(ui.Box, …)` 完全合法（`React` 就是宿主
+实例，`createElement`/`Fragment` 都安全）。
+
+### React 契约（必读，违反即首渲染崩溃）
+
+TUI 的 reconciler 是 **React 19**，场景组件运行在宿主的 React 实例上：
+
+- **hook 必须用 props 注入的 `React`**。插件从自己 node_modules 里 import 一个
+  React 副本调 hook，dispatcher 对不上，第一次渲染就是 invalid hook call。
+- **元素必须过宿主 runtime**。React 19 的 JSX 工厂产出
+  `Symbol.for('react.transitional.element')` 元素；插件自带的旧版 React（18 及
+  更早）编译出的 JSX 是 `Symbol.for('react.element')`，宿主 reconciler 直接拒绝。
+  所以 JSX 作者必须把 tsconfig 的 `jsxImportSource` 指向
+  `@deepseek-harness-tui/dsh-tui`（它的 `./jsx-runtime` 子路径原样 re-export 宿主
+  的 `react/jsx-runtime`），或者干脆只用注入 `React` 的 `createElement`。
+  插件自带的 React 副本**仅当同为 19.x 时**产出的元素才合法，且 hook 依然禁用。
+
+### 运行时语义
+
+- **屏幕栈**：插件场景位于 Chat early-return 链的最顶端——在 `/settings`、
+  `/resume` 浏览器、轨迹场景之上。场景打开期间这些屏幕保持挂载但让出屏幕与
+  键盘；`close()` 后落回之前所在的屏幕。
+- **inline / fullscreen 通吃**：inline 模式下 TUI 自动为场景包
+  `<AlternateScreen>`（DEC 1049 进出、帧 churn 不进 scrollback）；fullscreen
+  模式直接复用宿主已有的 alt screen，场景组件**不要**自己再包一层。
+- **命令异步打开也安全**：handler 是 async 的，命令结束后才 `open()` 也没问题——
+  打开动作经 channel 的 version bump 驱动重渲染，不依赖命令的返回时机。
+- **服务缺失时静默降级**：`ctx.get('tuiScenes')` 探测；旧版 patch 未挂
+  `dsh-tui-scenes` 行时 `open()` 打 warn 并返回 `false`，TUI 侧永不打开，
+  绝不拖垮启动（#183 原则）。
+- **生命周期**：场景注册与打开状态不随 `/new`、`/resume`、rewind 的 agent
+  切换重置；`channel` 始终指向当前 live agent。场景组件卸载（关屏）时 hook
+  状态随之销毁，重开是全新挂载。
+
+### 场景的红线
+
+- 场景打开期间**独占整个终端**：布局用 `flexGrow`/`useTerminalSize()` 自适应，
+  别假设固定行列数；也别往 stdout 写任何东西（调试走 `DSH_TUI_DEBUG` 的
+  stderr）。
+- 场景是会话的**观察者**：数据从 `channel` 读（rows、tokens、working、
+  traceEvents……），写操作（submit/steer/cancel）也能用，但打开/关闭本身
+  不产生任何 session 事件——别在场景里 append 事件，要发就走接缝一的
+  log-only 铁律。
+- 每一帧的重渲染成本由场景自己兜着：高频动画用 `ui.useAnimationFrame`，
+  别在渲染路径里做同步 I/O。
+- **渲染期异常有边界兜底**：场景组件 render/生命周期里抛错会被
+  `PluginSceneBoundary` 接住——转录里报一条错误、场景自动关闭，不会拖垮整个
+  TUI。但 boundary 管不到 effect 与异步回调里的异常，那些仍是场景自己的责任。
 
 ## 命名与发布规范
 

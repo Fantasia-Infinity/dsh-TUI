@@ -53,6 +53,9 @@ import { ActivityTracker, type ActivityState } from 'dsh-working-activity/status
 import { attachSessionToWorkspace } from './workspace.js'
 import { createLocalWorkspaceRuntime, type TuiWorkspaceCommand, type TuiWorkspaceCommandResult, type TuiWorkspaceTarget } from './workspaces.js'
 import type { TuiCommandTreeRuntime } from './command-trees.js'
+import type { TuiSettingsSection, TuiSettingsSectionsRuntime } from './settings-sections.js'
+import type { SettingsHost } from './settingsEditor.js'
+import type { TuiSceneDescriptor, TuiSceneRuntime } from './scenes.js'
 
 type ChannelImageBlock = Extract<ContentBlock, { type: 'image' }>
 type ChannelImageMediaType = ChannelImageBlock['attachment']['mediaType']
@@ -249,6 +252,16 @@ export interface LoadedContextSkill {
   readonly description: string
 }
 
+/** One skill in the live agent's catalog, for the `/skills` picker (issue #204). */
+export interface SkillInfo {
+  readonly name: string
+  readonly description: string
+  /** True when `/name` invokes it (it appears in the `/` menu, issue #86). */
+  readonly userInvocable: boolean
+  /** Discovery source bucket (bundled / user-* / project-* / runtime / …). */
+  readonly source: string
+}
+
 /** One model-visible tool from the prompt assembly. */
 export interface LoadedContextTool {
   readonly name: string
@@ -332,6 +345,8 @@ export interface Channel {
   readonly workingActivity: ActivityStatus | undefined
   /** Working-activity indicator preset name (`claude`/`moon`/…/`random`). */
   readonly activityFrames: string | undefined
+  /** Edit/Write diff presentation preference (`auto`/`split`/`unified`). */
+  readonly diffLayout: 'auto' | 'split' | 'unified'
   /** Whether the in-process working-activity line is shown (config.activity). */
   readonly activityEnabled: boolean
   /** Whether the segmented context bar row shows in the status footer
@@ -381,6 +396,22 @@ export interface Channel {
    * back to sending the line to the model).
    */
   runExternalCommand(name: string, rawInput: string): Promise<string | undefined>
+  /**
+   * Plugin-registered full-screen scene currently replacing the conversation
+   * (the `dsh-tui-scenes` runtime), if any. The chat screen renders its
+   * component INSTEAD of the transcript — the same whole-terminal treatment
+   * the trajectory scene gets — and hands it the keyboard; `undefined`
+   * renders the conversation normally.
+   */
+  readonly pluginScene: TuiSceneDescriptor | undefined
+  /**
+   * Open a registered plugin scene by id. Plugin command handlers usually
+   * call the runtime directly (`ctx.tuiScenes.open`); this passthrough lets
+   * host-side UI code do the same without touching cordis services.
+   */
+  openPluginScene(id: string): boolean
+  /** Close the open plugin scene, if any (a no-op otherwise). */
+  closePluginScene(): void
   /** 侧问（CC /btw）：无工具单轮 LLM 调用，复用当前会话上下文；结果不落 session log。 */
   sideQuestion(
     question: string,
@@ -478,12 +509,29 @@ export interface Channel {
   setActivityFrames(name: string): boolean
   /** Advertised models across every registered provider route (empty when the LLM service is absent). */
   listModels(): Promise<readonly LlmModelInfo[]>
+  /** The live agent's full skill catalog for `/skills` (issue #204) — name,
+   *  description, invocation flags and source bucket. Undefined on a failed
+   *  or incomplete registry read (the picker shows an error); empty only
+   *  when no registry is mounted or it genuinely holds nothing. */
+  listSkills(): Promise<readonly SkillInfo[] | undefined>
   /** Safe credential metadata for `/login`; undefined without the service. */
   describeCredential(ref: string): Promise<CredentialStatus | undefined>
   /** Runtime capabilities for the `/provider` wizard, over the settings /
    *  credentials / llm seams; undefined when the composition lacks them
    *  (bare cordis.yml start without the dsh-base services). */
   providerSetup(): ProviderSetupHost | undefined
+  /**
+   * Runtime capabilities for the `/settings` screen, over the settings /
+   * credentials seams; undefined when the composition lacks the settings
+   * service (the screen then renders plugin sections as unavailable and
+   * namespaces read-only).
+   */
+  settingsHost(): SettingsHost | undefined
+  /** Plugin-declared settings sections from the `tuiSettingsSections` seam
+   *  (empty when the seam or every provider is absent). */
+  settingsSections(): readonly TuiSettingsSection[]
+  /** Subscribe to settings-section register/unregister events. */
+  subscribeSettingsSections(listener: () => void): () => void
   /** Top-level entries of the session cwd for `@` file completion. */
   listFiles(): Promise<readonly string[]>
   /** Every session the persistence backend stores, classified and unfiltered
@@ -613,6 +661,10 @@ export interface ChannelState {
   workingActivity: ActivityStatus | undefined
   /** Working-activity indicator preset (see the public Channel type). */
   activityFrames: string | undefined
+  /** Diff presentation preference (see the public Channel type). */
+  diffLayout: 'auto' | 'split' | 'unified'
+  /** Apply a diff-layout change (see the public Channel type). */
+  setDiffLayout(layout: 'auto' | 'split' | 'unified'): void
   /** Working-activity display switch (see the public Channel type). */
   activityEnabled: boolean
   /** Context bar row switch (see the public Channel type). */
@@ -637,6 +689,12 @@ export interface ChannelState {
   commandCompletions(input: string): readonly CommandCompletion[]
   /** Run a plugin-registered command (see the public Channel type). */
   runExternalCommand(name: string, rawInput: string): Promise<string | undefined>
+  /** Open plugin scene mirrored from the scenes runtime (see the public Channel type). */
+  pluginScene: TuiSceneDescriptor | undefined
+  /** Open a plugin scene by id (see the public Channel type). */
+  openPluginScene(id: string): boolean
+  /** Close the open plugin scene (see the public Channel type). */
+  closePluginScene(): void
   /** Estimated context segments by content type (pi-nano-context style bar). */
   contextSegments: {
     system: number
@@ -695,10 +753,18 @@ export interface ChannelState {
   /** Switch the working-activity indicator preset (see the public Channel). */
   setActivityFrames(name: string): boolean
   listModels(): Promise<readonly LlmModelInfo[]>
+  /** The live agent's skill catalog for `/skills` (see the public Channel type). */
+  listSkills(): Promise<readonly SkillInfo[] | undefined>
   /** Safe credential metadata for `/login` (see the public Channel type). */
   describeCredential(ref: string): Promise<CredentialStatus | undefined>
   /** `/provider` wizard capabilities (see the public Channel type). */
   providerSetup(): ProviderSetupHost | undefined
+  /** `/settings` screen capabilities (see the public Channel type). */
+  settingsHost(): SettingsHost | undefined
+  /** Plugin-declared settings sections (see the public Channel type). */
+  settingsSections(): readonly TuiSettingsSection[]
+  /** Subscribe to settings-section register/unregister events. */
+  subscribeSettingsSections(listener: () => void): () => void
   listFiles(): Promise<readonly string[]>
   listSessions(): Promise<readonly SessionSummary[]>
   /** Trailing exchanges of a persisted session (see the public Channel type). */
@@ -1002,6 +1068,9 @@ export function createChannel(
     /** Indicator preset for the working-activity line (`claude`/`moon`/
      *  `comet`/`dots`/… or `random`); default `claude`. */
     activityFrames?: string
+    /** Edit/Write diff presentation; default `auto` (side-by-side ≥110
+     *  columns, unified below). */
+    diffLayout?: 'auto' | 'split' | 'unified'
     /** Show the segmented context bar row in the status footer; default on
      *  (cordis.yml `contextBar: false` hides it, issue #29). */
     contextBar?: boolean
@@ -1037,6 +1106,17 @@ export function createChannel(
   // the degraded-boot warning for profile launches.
   const workspaceService = ctx.get('tuiWorkspaces') ?? createLocalWorkspaceRuntime()
   const commandTrees = ctx.get('tuiCommandTrees') as TuiCommandTreeRuntime | undefined
+  // The `/settings` screen reads its host on EVERY render, so the host must
+  // be a stable object: a fresh literal per call would re-fire the screen's
+  // host-keyed effects endlessly (render → new host → effect → state →
+  // render). The underlying services are fixed for the channel's lifetime,
+  // so compute once and cache.
+  let settingsHostCache: SettingsHost | undefined
+  let settingsHostResolved = false
+  // Plugin scene runtime (optional service, same degradation rule as
+  // tuiWorkspaces/tuiCommandTrees): mounted by the bundle patch's
+  // dsh-tui-scenes row; absent the row, `pluginScene` simply stays undefined.
+  const sceneRuntime = ctx.get('tuiScenes') as TuiSceneRuntime | undefined
   // Shift+Tab session-mode cycle: cordis.yml `modes` wins; absent/empty/
   // atom-less → the built-in default/plan/full cycle (sessionModes.ts).
   const { modes: sessionModes, dropped: droppedModeIds } = resolveSessionModes(options.modes)
@@ -1422,6 +1502,7 @@ export function createChannel(
     modeIndex: 0,
     workingActivity: undefined,
     activityFrames: options.activityFrames,
+    diffLayout: options.diffLayout ?? 'auto',
     activityEnabled: options.activity !== false,
     contextBarEnabled: options.contextBar !== false,
     agentPreset: options.agentPreset,
@@ -2245,6 +2326,11 @@ export function createChannel(
         }
       }, item.timeoutMs)
     },
+    setDiffLayout(layout) {
+      if (layout === state.diffLayout) return
+      state.diffLayout = layout
+      state.emit()
+    },
     setActivityFrames(name) {
       if (!isPresetName(name)) {
         state.notify(t('unknown-activity-preset', { name }), { color: 'error' })
@@ -2363,12 +2449,100 @@ export function createChannel(
       return Promise.all(providers.map(provider => llm.listModels(provider.id).catch(() => [])))
         .then(lists => lists.flat())
     },
+    async listSkills() {
+      // snapshot() over list(): only a COMPLETE observation is authoritative
+      // (same contract as the skill-command merge above) — a partial catalog
+      // must surface as "failed", not as a misleading near-empty picker.
+      const registry = skillRegistryFor(agent)
+      if (registry === undefined) return []
+      try {
+        const observation = await registry.snapshot(skillViewOptions(agent))
+        if (!observation.complete) return undefined
+        return observation.skills.map(skill => ({
+          name: skill.name,
+          description: skill.description,
+          userInvocable: isUserInvocable(skill),
+          source: skill.source,
+        }))
+      } catch {
+        return undefined
+      }
+    },
     async describeCredential(ref) {
       const credentials = ctx.get('credentials') as
         | { describe(ref: string): Promise<CredentialStatus> }
         | undefined
       if (!credentials) return undefined
       return credentials.describe(ref)
+    },
+    settingsHost(): SettingsHost | undefined {
+      if (settingsHostResolved) return settingsHostCache
+      settingsHostResolved = true
+      // The `/settings` screen's runtime surface, over the same dsh-base
+      // seams the `/provider` wizard uses: settings (namespace descriptors +
+      // revision-fenced mutate) and credentials (secret writes). Structurally
+      // typed like the other optional seams in this file.
+      const settings = ctx.get('settings') as
+        | {
+          describe(options?: { redactSecrets?: boolean }): readonly {
+            ns: string
+            revision: number
+            applies: 'live' | 'restart'
+            value: unknown
+            user?: unknown
+          }[]
+          mutate(
+            ns: string,
+            ops: readonly (
+              | { op: 'set'; path: readonly string[]; value: unknown }
+              | { op: 'unset'; path: readonly string[] }
+            )[],
+            expectedRevision?: number,
+          ): Promise<void>
+        }
+        | undefined
+      const credentials = ctx.get('credentials') as
+        | {
+          resolve(ref: string): Promise<{ value: string } | undefined>
+          set(ref: string, value: string): Promise<void>
+        }
+        | undefined
+      if (!settings) return undefined
+      settingsHostCache = {
+        listNamespaces() {
+          // redactSecrets: the screen never renders a secret literal — secret
+          // fields are write-only controls over the credentials seam.
+          return settings.describe({ redactSecrets: true }).map(descriptor => ({
+            ns: descriptor.ns,
+            revision: descriptor.revision,
+            applies: descriptor.applies,
+            value: descriptor.value,
+            user: descriptor.user,
+          }))
+        },
+        write(ns, ops, expectedRevision) {
+          return settings.mutate(ns, ops, expectedRevision)
+        },
+        async credentialConfigured(ref) {
+          // The environment shadows the store (providerSetup.envShadows), so
+          // an env-provided key counts as configured.
+          if (process.env[ref] !== undefined) return true
+          return credentials !== undefined && (await credentials.resolve(ref)) !== undefined
+        },
+        async writeCredential(ref, value) {
+          if (!credentials) throw new Error('credentials service unavailable')
+          await credentials.set(ref, value)
+        },
+      }
+      return settingsHostCache
+    },
+    settingsSections(): readonly TuiSettingsSection[] {
+      const sections = ctx.get('tuiSettingsSections') as TuiSettingsSectionsRuntime | undefined
+      return sections?.list() ?? []
+    },
+    subscribeSettingsSections(listener: () => void): () => void {
+      const sections = ctx.get('tuiSettingsSections') as TuiSettingsSectionsRuntime | undefined
+      return sections?.subscribe(listener) ?? (() => {})
     },
     providerSetup(): ProviderSetupHost | undefined {
       // The `/provider` wizard's runtime surface, over the dsh-base seams:
@@ -2615,6 +2789,13 @@ export function createChannel(
     runExternalCommand(name, rawInput) {
       return executeRegistryCommand(name, rawInput)
     },
+    pluginScene: sceneRuntime?.active,
+    openPluginScene(id: string) {
+      return sceneRuntime?.open(id) ?? false
+    },
+    closePluginScene() {
+      sceneRuntime?.close()
+    },
     pushLocal(title, lines) {
       state.rows.push({ id: nextRowId++, kind: 'local', text: title })
       for (const line of lines) {
@@ -2802,6 +2983,7 @@ export function createChannel(
     },
     releaseContributions() {
       releaseSkillCommands()
+      unsubscribeScenes?.()
     },
     traceEvents() {
       // Immutable per-append snapshot (dsh-session caches the frozen array);
@@ -3102,25 +3284,38 @@ export function createChannel(
         const dispose = commandService.register({
           name,
           description,
-          // The injected body is the payload; recording the (empty) raw input
-          // would only duplicate the command name into the session log.
+          // The invocation line is re-submitted as a user message (kernel
+          // path) or replaced by the injected body (fallback) — recording
+          // the raw input here too would duplicate it in the session log.
           recordInput: false,
-          handler: async ({ agent: invoker, signal }) => {
+          handler: async ({ agent: invoker, rawInput, signal }) => {
+            // Kernel gesture path: the `skill` tool and dsh-tool-skill's
+            // pre-step boundary mount together, so a visible `skill` tool
+            // means the boundary scans this agent's user messages for the
+            // `/name` gesture and injects the rendered body host-side —
+            // the same architecture as the web client's ui-skill. Routing
+            // through it keeps the user's args in the transcript message
+            // (rawInput rides along instead of being swallowed by the
+            // command layer) and matches the kernel's own adjudication.
+            const tools = ctx.get('tools') as ToolsRegistryLike | undefined
+            if (tools?.get('skill', invoker) !== undefined) {
+              deliverUserText(`/${name}${rawInput}`, 'followup')
+              // Silent success: the submitted message is the feedback.
+              return { kind: 'success' }
+            }
+            // Fallback for compositions without dsh-tool-skill (e.g. the
+            // minimal preset): inject the rendered body directly, in the
+            // official user-explicit invocation shape (dsh-skill's
+            // SkillInvocationSource).
             const view = { ...skillViewOptions(invoker), signal }
             const skill = await skillRegistryFor(invoker)?.get(name, view)
             if (skill === undefined || !isUserInvocable(skill as SkillSummary)) {
               return { kind: 'error', text: t('skill-unavailable', { name }) }
             }
-            // The official user-explicit invocation shape (dsh-skill's
-            // SkillInvocationSource): the rendered body rides as instructions
-            // the model follows, and transcript consumers present it from the
-            // source metadata instead of re-parsing model-facing text.
             invoker.followup(createUserMessage({
               content: [{ type: 'text', text: renderSkillContent(skill as never) }],
               source: { kind: 'skill-invocation', name, form: 'instructions' },
             }))
-            // Silent success: the agent visibly starts working on the skill,
-            // which is the feedback (CC shows no banner either).
             return { kind: 'success' }
           },
         })
@@ -3133,6 +3328,16 @@ export function createChannel(
   }
   ctx.on('skills/change', () => {
     void refreshSkillCommands()
+  })
+  /**
+   * Mirror the scene runtime's active scene into channel state, so screens
+   * swap to it through the ordinary version-bump re-render instead of a
+   * second subscription channel.
+   */
+  const unsubscribeScenes = sceneRuntime?.subscribe(() => {
+    if (state.pluginScene === sceneRuntime.active) return
+    state.pluginScene = sceneRuntime.active
+    state.emit()
   })
   /** See {@link Channel.releaseContributions}. */
   const releaseSkillCommands = (): void => {
@@ -3505,11 +3710,17 @@ ${output}
         break
       }
       case 'assistant/message': {
-        const row = ensureStreaming(event.seq)
-        row.time = event.time
         const text = textOf(event.data.message.content)
-        if (text) row.text = text
-        row.streaming = false
+        // Reasoning/tool-only steps emit no text: creating an assistant row
+        // anyway leaves an empty `●` bullet in the transcript. A pre-existing
+        // streaming row always has text (ensureStreaming is only reached on
+        // non-empty text deltas), so only create one when text arrives.
+        const row = streaming ?? (text ? ensureStreaming(event.seq) : undefined)
+        if (row !== undefined) {
+          row.time = event.time
+          if (text) row.text = text
+          row.streaming = false
+        }
         streaming = undefined
         if (reasoning !== undefined) {
           // Seal, don't fold: the per-step duration settles here, but the
