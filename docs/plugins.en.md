@@ -98,7 +98,7 @@ What lives in this repository:
 
 - `vendor/dsh-std/` — the pinned-revision official protocol packages
   (manifest parser, projection, ProtocolCatalog, and contract validators).
-- `ecosystem-spec/` — the pinned admission-profile registry, schemas, and
+- `dsh-ecosystem-spec/` — the pinned admission-profile submodule containing the registry, schemas, and
   conformance fixtures; `npm run verify:plugin-spec` checks profile hashes and
   fixture drift.
 - `src/plugin-spec/` — the validation/negotiation layer: the official parser
@@ -126,7 +126,7 @@ grants deny-default permissions; the optional `denies` section revokes
 allow-default ones; unregistered permission names are always denied (even if
 explicitly granted in the file). The three file states are strictly
 distinguished: **missing** (ENOENT) = all defaults (the natural pre-grant
-posture); **unparseable** = fail closed, denying even allow-default
+posture); **syntactically or structurally invalid** = fail closed, denying even allow-default
 permissions; **any other read failure** (EACCES/EISDIR/I/O — the file
 exists but cannot be evaluated) is treated as corrupt and fails closed too,
 never silently falling back to defaults (otherwise `denies` would quietly
@@ -928,11 +928,11 @@ Rules (all "refuse + warn, never throw"):
 - **ctrl or alt is mandatory** — bare letters are typing, bare arrows are
   navigation.
 - **Reserved combos are refused at registration**: the TUI's own bindings
-  (ctrl+c/d/t/r/x/o/l/e/v/a/u/k/w, ctrl+←/→, ctrl/alt+Enter, alt+↑, Esc, Tab,
+  (ctrl+c/d/t/r/g/o/l/e/v/a/u/k/w, ctrl+←/→, ctrl/alt+Enter, alt+↑, Esc, Tab,
   Shift+Tab). This is the enforcement of "locals win": a collision can never
   reach the matcher. Built-ins match a MODIFIER SUBSET (`isMod && char`,
   never excluding an extra Shift), so SHIFT-SUPERSETS of reserved combos are
-  refused too — `ctrl+shift+x` IS Ctrl+X on terminals that don't report
+  refused too — `ctrl+shift+g` IS Ctrl+G on terminals that don't report
   Shift distinctly, and registering it would either shadow the built-in or
   never fire.
 - Re-registering the same canonical combo is refused.
