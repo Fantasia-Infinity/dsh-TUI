@@ -145,8 +145,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'keys-paste',
     group: 'keys',
-    zh: 'Ctrl+V 粘贴文本、文件路径或图片附件',
-    en: 'Ctrl+V pastes text, file paths, or image attachments',
+    zh: 'Ctrl+V 或 Alt+V 粘贴文本、文件路径或图片附件；/settings 可改快捷键',
+    en: 'Ctrl+V or Alt+V pastes text, file paths, or image attachments; remappable in /settings',
   },
   {
     id: 'keys-slash-search',
@@ -527,6 +527,12 @@ export const TIPS: readonly Tip[] = [
     en: 'Drag-select copies instantly in fullscreen; Esc cancels',
   },
   {
+    id: 'disp-hover-footer',
+    group: 'display',
+    zh: '悬停底栏字段：ctx 原地变等宽压力条，明细走常驻底行，布局不动',
+    en: 'Hover footer fields: ctx morphs in place into a same-width bar, details on a stable line',
+  },
+  {
     id: 'disp-wheel-sel',
     group: 'display',
     zh: '有文本选区时，滚轮平移选区而非滚动列表',
@@ -549,8 +555,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'pit-esc',
     group: 'pitfalls',
-    zh: '审批条 Esc=拒绝；问卷 Esc=取消整批提问',
-    en: 'Esc rejects approvals and cancels question batches',
+    zh: '审批条 Esc=拒绝；问卷第 2 题起 Esc=上一题，Ctrl+C=取消整批',
+    en: 'Esc rejects approvals; question batches use Esc for previous and Ctrl+C to cancel',
   },
   {
     id: 'pit-ctrl-c',
