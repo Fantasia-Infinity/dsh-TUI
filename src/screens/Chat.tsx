@@ -1,5 +1,5 @@
 import React from 'react'
-import { t, getLang, setLang, isLang, writeLangPref, readLangPref, subscribeLang, LANGS, type I18nKey, type Lang } from '../i18n.js'
+import { t, getLang, setLang, isLang, writeLangPref, readLangPref, subscribeLang, LANGS, type Lang } from '../i18n.js'
 import { readThemePref } from '../themePrefs.js'
 import { readPresetPref } from '../presetPrefs.js'
 import { readModelPref } from '../modelPrefs.js'
@@ -14,12 +14,21 @@ import { isPlainReturnInput, modLabel } from '../utils/modifiers.js'
 import { actionMatches } from '../utils/keymap.js'
 import { formatTokens } from '../cc/format.js'
 import { homeDir } from '../utils/paths.js'
-import type { LlmModelInfo } from '../dsh-adapter/types.js'
-import { sessionCwdMatches, type Channel, type ChatRow, type EffortOption, type PresetOption, type SkillInfo } from '../dsh-adapter/channel.js'
+import type { LlmModelInfo, LlmProviderInfo } from '../dsh-adapter/types.js'
+import { cleanRenderText, cleanScalarText } from '../dsh-adapter/sanitize.js'
+import {
+  deriveModelGroups,
+  modelPickerLanding,
+  recentCatalogModels,
+  RECENTS_GROUP_PROVIDER,
+} from '../modelGroups.js'
+import { readModelRecents, recordModelUse, type ModelRecentsRef } from '../modelRecents.js'
+import { sessionCwdMatches, type Channel, type ChatRow, type EffortOption, type PermissionPresetSnapshot, type PresetOption, type SkillInfo } from '../dsh-adapter/channel.js'
 import type { QuestionStore } from '../dsh-adapter/questions.js'
 import { TuiDialogStore } from '../dsh-adapter/dialogs.js'
 import { TuiStatusStore } from '../dsh-adapter/status.js'
 import type { TuiShortcutHost } from '../dsh-adapter/shortcuts.js'
+import type { TuiThemeHost } from '../dsh-adapter/themes.js'
 import type { TuiRewindMode } from '../dsh-adapter/extension-events.js'
 import { runProviderWizard } from '../dsh-adapter/providerWizard.js'
 import { ApprovalStore } from '../dsh-adapter/approvals.js'
@@ -39,8 +48,13 @@ import { ScrollbarGutter } from '../components/ScrollbarGutter.js'
 import type { TimelineSnapshot } from '../ink/timeline-rail.js'
 import { normalizeScrollGutter } from '../tuiDisplayPrefs.js'
 import { OverlayAbove } from '../components/OverlayAbove.js'
+import { TooltipLayer } from '../components/Tooltip.js'
 import { PromptInput, type PromptController } from '../components/PromptInput.js'
+import { PromptEditorLayer } from '../components/PromptEditor.js'
 import { GoalTodoPanel } from '../components/GoalTodoPanel.js'
+import { AutoRecapRow } from '../components/AutoRecapRow.js'
+import { BalanceReportRow } from '../components/BalanceReportRow.js'
+import type { BalanceResult } from '../deepseekBalance.js'
 import { LoadedContextPanel } from '../components/LoadedContextPanel.js'
 import { StatusLine } from './StatusLine.js'
 import { WorkingSpinner, useThinkingStatus } from '../components/WorkingSpinner.js'
@@ -49,15 +63,17 @@ import { ModelPicker } from '../components/ModelPicker.js'
 import { PluginSceneBoundary } from '../components/PluginSceneBoundary.js'
 import { SkillsPicker, SkillsPickerLoading } from '../components/SkillsPicker.js'
 import { SessionBrowser } from './SessionBrowser.js'
+import { SessionTree } from './SessionTree.js'
 import { Settings } from './Settings.js'
 import { WorkspacePicker } from '../components/WorkspacePicker.js'
 import { WorkspaceMenuPicker } from '../components/WorkspaceMenuPicker.js'
 import { WorkspaceFlowPicker } from '../components/WorkspaceFlowPicker.js'
 import type { TuiWorkspaceCommandResult, TuiWorkspaceTarget } from '../workspaces.js'
 import { ActivityPicker } from '../components/ActivityPicker.js'
+import { ColorPicker } from '../components/ColorPicker.js'
 import { EffortSlider } from '../components/EffortSlider.js'
 import { PresetPicker } from '../components/PresetPicker.js'
-import { PermissionsPicker, PERMISSION_PRESET_IDS } from '../components/PermissionsPicker.js'
+import { PermissionsPicker } from '../components/PermissionsPicker.js'
 import { PlanPicker } from '../components/PlanPicker.js'
 import { LangPicker } from '../components/LangPicker.js'
 import { ThemePicker, getThemeOptions } from '../components/ThemePicker.js'
@@ -67,12 +83,15 @@ import { ThinkingToggle } from '../components/ThinkingToggle.js'
 import { HistorySearchDialog } from '../components/HistorySearchDialog.js'
 import { RewindPicker } from '../components/RewindPicker.js'
 import { BtwPanel } from '../components/BtwPanel.js'
+import { RecapPanel } from '../components/RecapPanel.js'
+import { isValidSessionColor, SESSION_COLOR_NAMES } from '../cc/sessionColors.js'
 import { TipsPanel } from '../components/TipsPanel.js'
 import { SubagentDashboard } from '../components/SubagentDashboard.js'
 import { SubagentDetailScene } from '../components/SubagentDetailScene.js'
 import { FileActionsPanel, FILE_ACTION_COUNT } from '../components/FileActionsPanel.js'
 import { openExternal, openFile, revealInFileManager } from '../utils/openExternal.js'
-import { fileUrlToPath, parseFileLinkUrl, resolveTargetPath } from '../utils/fileTarget.js'
+import { resolveTargetPath } from '../utils/fileTarget.js'
+import { classifyOpenTarget } from '../utils/urlGuard.js'
 import { statSync } from 'node:fs'
 import { setClipboard } from '../ink/termio/osc.js'
 import { TerminalWriteContext } from '../ink/useTerminalNotification.js'
@@ -98,6 +117,29 @@ import {
 /** Shared empty snapshot for hosts whose channel has no event log. */
 const NO_EVENTS: readonly SessionEvent[] = []
 
+const PERMISSION_RESULT_CELLS = 200
+
+function cleanPermissionError(error: unknown): string {
+  try {
+    if (error instanceof Error) {
+      return typeof error.message === 'string'
+        ? cleanRenderText(error.message, PERMISSION_RESULT_CELLS)
+        : ''
+    }
+    return cleanScalarText(error, PERMISSION_RESULT_CELLS)
+  } catch {
+    return ''
+  }
+}
+
+function clonePermissionPresetSnapshot(snapshot: PermissionPresetSnapshot): PermissionPresetSnapshot {
+  return {
+    availability: snapshot.availability,
+    options: snapshot.options.map(option => ({ ...option })),
+    ...(snapshot.current === undefined ? {} : { current: { ...snapshot.current } }),
+  }
+}
+
 /** Row kinds the message-selection cursor can land on. */
 const SELECTABLE_KINDS = new Set<ChatRow['kind']>([
   'user',
@@ -117,23 +159,6 @@ const NO_ROWS: readonly ChatRow[] = []
 /** `max` → `Max` (effort levels arrive lower-case from the adapter). */
 function capitalize(text: string): string {
   return text.length === 0 ? text : text[0].toUpperCase() + text.slice(1)
-}
-
-/**
- * CC's built-in skill commands, driven through the DSH skill system: each
- * submits an activation prompt the model resolves via its skill catalog/load
- * tools (the corresponding SKILL.md ships under ~/.dsh/skills with dsh-tui).
- */
-// i18n keys, not resolved strings: module scope evaluates before apply()'s
-// setLang, so t() must run at the call site to follow the active language.
-const SKILL_PROMPTS: Readonly<Record<string, I18nKey>> = {
-  audit: 'skill-audit-prompt',
-  bug: 'skill-bug-prompt',
-  practice: 'skill-practice-prompt',
-  review: 'skill-review-prompt',
-  pr_comments: 'skill-pr-comments-prompt',
-  'release-notes': 'skill-release-notes-prompt',
-  'vuln-check': 'skill-vuln-check-prompt',
 }
 
 /** Terminal-title spinner frames (CC's TITLE_ANIMATION_FRAMES). */
@@ -191,6 +216,7 @@ export function Chat({
   extensionDialogs,
   extensionStatus,
   extensionShortcuts,
+  themeHost,
   onExit,
   onUpdate,
   onRestart,
@@ -215,6 +241,8 @@ export function Chat({
   extensionStatus?: TuiStatusStore
   /** Host-only keyboard shortcut dispatch path. */
   extensionShortcuts?: TuiShortcutHost
+  /** Optional runtime theme host; static JSON themes work without it. */
+  themeHost?: TuiThemeHost
   onExit: () => void
   /** Update the installed package and restart the current TUI process. */
   onUpdate?: () => void
@@ -336,12 +364,69 @@ export function Chat({
    * list while the fresh one loads, exactly as the boolean era did.
    */
   const [overlay, dispatchOverlay] = React.useReducer(chatOverlayReducer, NO_OVERLAY)
+  // Chat and PromptInput both receive one parsed stdin batch. Keep the
+  // permission focus synchronous so arrow+Enter in the same batch uses the
+  // post-arrow row rather than the previous render's index.
+  const permissionOverlayFocusRef = React.useRef<{ overlay: unknown; index: number } | null>(null)
+  if (overlay.kind === 'permission') {
+    // Seed each concrete picker instance once. Subsequent renders from
+    // channel/store updates must not overwrite a focus change that has already
+    // been applied synchronously for an arrow+Enter batch.
+    if (permissionOverlayFocusRef.current?.overlay !== overlay) {
+      permissionOverlayFocusRef.current = { overlay, index: overlay.index }
+    }
+  } else {
+    permissionOverlayFocusRef.current = null
+  }
   const [models, setModels] = React.useState<readonly LlmModelInfo[]>([])
+  /** Provider display identities for the /model group level; refreshed alongside `models`. */
+  const [providerInfos, setProviderInfos] = React.useState<readonly LlmProviderInfo[]>([])
+  /** /model 最近使用分组：成功切换即记录（去重置顶，上限 10），重启保留。 */
+  const [modelRecents, setModelRecents] = React.useState<readonly ModelRecentsRef[]>(() => readModelRecents())
+  /** Two-level /model: the drilled-in provider route; undefined = group level.
+   *  Reset on open; stale ids resolve back to the group level via `activeModelGroup`. */
+  const [modelGroup, setModelGroup] = React.useState<string | undefined>(undefined)
+  /** True while the picker sits in the single-provider fast path (drilled in
+   *  at open, the group level never shown): Esc closes directly and no back
+   *  hint renders — a pinned recents pseudo-group must not fake a two-level
+   *  walk the user never saw (issue #527 regression: repro-picker-windowing). */
+  const [modelPickerDirect, setModelPickerDirect] = React.useState(false)
+  /** Group rows over the current catalog, first-appearance (registry) order,
+   *  with the pinned recents pseudo-group first when any entry is catalogued. */
+  const modelGroups = React.useMemo(
+    () => deriveModelGroups(models, providerInfos, modelRecents),
+    [models, providerInfos, modelRecents],
+  )
+  /** The drilled-in group, but only while it still exists in the catalog. */
+  const activeModelGroup = modelGroup !== undefined && modelGroups.some(group => group.provider === modelGroup)
+    ? modelGroup
+    : undefined
+  const groupModels = React.useMemo(() => {
+    if (activeModelGroup === undefined) return []
+    if (activeModelGroup === RECENTS_GROUP_PROVIDER) return recentCatalogModels(modelRecents, models)
+    return models.filter(model => model.provider === activeModelGroup)
+  }, [models, modelRecents, activeModelGroup])
+  /** Switch + record: every successful switch feeds the /model recents group
+   *  (picker Enter/click, `/model provider/id`, the wizard's live switch,
+   *  and /reload's applied model all ride this one path). */
+  const switchModelRecorded = (provider: string, id: string, name?: string): Promise<boolean> => {
+    if (name !== undefined) channel.notify(t('model-switching', { name }))
+    return channel.switchModel(provider, id).then((ok) => {
+      if (!ok) return ok
+      if (name !== undefined) channel.notify(t('model-switched', { name }))
+      setModelRecents(recordModelUse({ provider, id }))
+      return ok
+    })
+  }
   /** `/skills` 技能目录（issue #204）：null = 注册表快照在途。 */
   const [skillsList, setSkillsList] = React.useState<readonly SkillInfo[] | null>(null)
   /** `/resume` opens the session browser, a screen rather than a panel. It
    *  owns its own selection, filters and keyboard — Chat only opens it. */
   const [browserOpen, setBrowserOpen] = React.useState(false)
+  /** `/tree` opens the session family tree (pi's Session Tree): every rewind
+   *  fork stitched back onto the message it diverged from, hover previews,
+   *  and per-node rewind/fork/adopt actions. Like the browser, a screen. */
+  const [treeOpen, setTreeOpen] = React.useState(false)
   /** `/settings` opens the plugin settings screen (issue #165) — like the
    *  browser, a screen rather than a panel: it owns its own focus, staged
    *  drafts and keyboard; Chat only opens it. */
@@ -375,6 +460,96 @@ export function Chat({
     btwAbortRef.current = null
     setBtw(null)
   }
+  /** /recap overlay (pi-recap semantics): pure UI state like /btw — the
+   *  summary never enters the transcript or session log; applying the
+   *  proposed title goes through the normal /rename path. `auto` marks the
+   *  recapOnOpen-triggered run (rendered as the dim AutoRecapRow until
+   *  expanded); `expanded` lifts an auto recap into the full RecapPanel;
+   *  `rowsAtTrigger` is the last user-row id when the auto run started —
+   *  a newer user row (the user starts a new message) retires the recap. */
+  const [recap, setRecap] = React.useState<{
+    raw: string
+    summary: string
+    title?: string
+    error?: string
+    done: boolean
+    titleApplied: boolean
+    auto?: boolean
+    expanded?: boolean
+    rowsAtTrigger?: number
+  } | null>(null)
+  const recapAbortRef = React.useRef<AbortController | null>(null)
+  const closeRecap = () => {
+    recapAbortRef.current?.abort()
+    recapAbortRef.current = null
+    setRecap(null)
+  }
+  /** /balance report (`BalanceReportRow`): pure UI state like /recap — the
+   *  result never enters the transcript or session log. Clicking the row
+   *  re-queries (refreshing keeps the stale summary visible); a session
+   *  switch retires the report. */
+  const [balance, setBalance] = React.useState<{
+    result: BalanceResult | null
+    refreshing: boolean
+  } | null>(null)
+  const balanceSeqRef = React.useRef(0)
+  const runBalance = React.useCallback(() => {
+    const seq = ++balanceSeqRef.current
+    setBalance(prev => ({ result: prev?.result ?? null, refreshing: true }))
+    void channel.balanceInfo().then(result => {
+      if (balanceSeqRef.current !== seq) return
+      setBalance({ result, refreshing: false })
+    })
+  }, [channel])
+  const balanceSessionId = channel.agentId
+  React.useEffect(() => {
+    setBalance(null)
+  }, [balanceSessionId])
+  // Auto-recap (`dsh-tui.recapOnOpen`): every time the session switches
+  // (mount = open/resume, rewind/fork included), summarize its tail into
+  // the dim AutoRecapRow. Failures stay silent in auto mode — `/recap`
+  // surfaces them; the summary never enters the transcript or session log.
+  const autoRecapSessionId = channel.agentId
+  React.useEffect(() => {
+    // A session switch retires the previous recap outright — an old
+    // session's 回顾 has no place above a new conversation.
+    setRecap(null)
+    if (!channel.autoRecapOnOpen) return
+    // No conversation yet (/new): nothing to recap, don't even fire.
+    if (!channel.rows.some(row => row.kind === 'user' || row.kind === 'assistant')) return
+    recapAbortRef.current?.abort()
+    const controller = new AbortController()
+    recapAbortRef.current = controller
+    const lastUserId = channel.rows.filter(row => row.kind === 'user').at(-1)?.id ?? -1
+    setRecap({ raw: '', summary: '', error: undefined, done: false, titleApplied: false, auto: true, expanded: false, rowsAtTrigger: lastUserId })
+    void channel.recapRecent({
+      signal: controller.signal,
+      onText: delta => setRecap(prev => (prev ? { ...prev, raw: prev.raw + delta } : prev)),
+    }).then(result => {
+      if (controller.signal.aborted) return
+      setRecap(prev => {
+        if (prev === null || !prev.auto) return prev
+        // Auto mode stays quiet on failure (no activity / llm missing / error).
+        if (result.summary === null) return null
+        return { ...prev, summary: result.summary, title: result.title, error: result.error, done: true }
+      })
+    })
+    return () => controller.abort()
+  }, [autoRecapSessionId])
+  // The user starts a new message → the auto recap has served its purpose
+  // (catching them up) and bows out. A newer user row is the signal; the
+  // assistant's own streamed rows don't count.
+  const lastUserRowId = channel.rows.filter(row => row.kind === 'user').at(-1)?.id ?? -1
+  React.useEffect(() => {
+    if (
+      recap !== null &&
+      recap.auto &&
+      recap.rowsAtTrigger !== undefined &&
+      lastUserRowId > recap.rowsAtTrigger
+    ) {
+      closeRecap()
+    }
+  }, [lastUserRowId, recap])
   /** Subagent dashboard (Ctrl+A): displays active/completed subagents. */
   const [subagentDashboardOpen, setSubagentDashboardOpen] = React.useState(false)
   /** Detail view for a specific subagent (opened from dashboard). */
@@ -385,6 +560,7 @@ export function Chat({
    */
   const [logoNonce, setLogoNonce] = React.useState(0)
   React.useEffect(() => () => btwAbortRef.current?.abort(), [])
+  React.useEffect(() => () => recapAbortRef.current?.abort(), [])
   /**
    * The trajectory scene (issue #80 evolution). Unlike every other overlay
    * here it is not a panel but a whole screen: while open, Chat renders the
@@ -465,17 +641,18 @@ export function Chat({
   }, [])
 
   const handleOpenTarget = React.useCallback((url: string): void => {
-    const rawPath = parseFileLinkUrl(url)
-    if (rawPath !== undefined) {
-      openFileActions(rawPath)
+    const classification = classifyOpenTarget(url)
+    if (classification.kind === 'file-actions') {
+      openFileActions(classification.path)
       return
     }
-    const filePath = fileUrlToPath(url)
-    if (filePath !== undefined) {
-      openFileActions(filePath)
+    if (classification.kind === 'external') {
+      openExternal(url)
       return
     }
-    openExternal(url)
+    // Non-http(s) schemes from model/plugin-shaped links are not handed to
+    // the OS handler — see urlGuard.ts. Silently ignored: a toast needs
+    // channel state the Ink click path does not carry.
   }, [openFileActions])
 
   // Wire the click-to-open callback into the Ink instance (the field is
@@ -506,6 +683,10 @@ export function Chat({
   const isSticky = React.useSyncExternalStore(
     cb => (handle ? handle.subscribe(cb) : () => {}),
     () => (handle ? handle.isSticky() : true),
+  )
+  const subscribeTooltipInvalidation = React.useCallback(
+    (listener: () => void) => (handle ? handle.subscribe(listener) : () => {}),
+    [handle],
   )
 
   // "N new messages" pill: new rows whose top edge is still BELOW the
@@ -736,15 +917,22 @@ export function Chat({
    * result text lands as a notification. `rawInput` carries the text after
    * the command name (`/plan off` → ` off`).
    */
-  /** Localized display name of a sandbox mode id (`read-only` /
-   *  `workspace-write` / `danger-full-access`), for `/permission status`. */
-  const permissionPresetName = (id: string | undefined): string => {
-    switch (id) {
-      case 'read-only': return t('permission-preset-readonly')
-      case 'workspace-write': return t('permission-preset-workspace-write')
-      case 'danger-full-access': return t('permission-preset-full-access')
-      default: return id ?? '—'
-    }
+  /** Route every permission switch through the official command path. */
+  const runPermissionCommand = (rawInput: string): void => {
+    const originAgentBinding = channel.agentBindingGeneration
+    void channel.runExternalCommand('permission', rawInput).then((text) => {
+      if (channel.agentBindingGeneration !== originAgentBinding) return
+      if (text === undefined) {
+        channel.notify(t('command-not-found', { name: 'permission' }), { color: 'error' })
+        return
+      }
+      const cleaned = typeof text === 'string' ? cleanRenderText(text, PERMISSION_RESULT_CELLS) : ''
+      if (cleaned !== '') channel.notify(cleaned)
+    }).catch((error: unknown) => {
+      if (channel.agentBindingGeneration !== originAgentBinding) return
+      const detail = cleanPermissionError(error)
+      if (detail !== '') channel.notify(detail, { color: 'error' })
+    })
   }
 
   /** Hot-swap the UI language (`/lang <id>` and the LangPicker both land
@@ -941,7 +1129,7 @@ export function Chat({
       }
       case 'theme': {
         // Bare `/theme` opens the interactive color picker (`auto` + built-in
-        // palettes + user themes from ~/.dsh-tui/themes); `/theme <name>`
+        // palettes + static/runtime themes); `/theme <name>`
         // switches directly; `/theme status` shows the current choice.
         // `auto` follows the terminal background (OSC 11). Selection
         // persists to ~/.dsh-tui/theme.json and hot swaps via the
@@ -964,6 +1152,8 @@ export function Chat({
         }
         if (parts.length > 0) {
           setHelpOpen(false)
+          // setTheme rejects unknown names via isThemeAvailable, so pass the
+          // raw argument instead of resolving it against the catalog first.
           const ok = setTheme(parts[0])
           channel.notify(
             ok ? t('theme-switched-saved', { name: parts[0] }) : t('theme-unknown', { name: parts[0] }),
@@ -976,16 +1166,58 @@ export function Chat({
           type: 'open',
           overlay: {
             kind: 'theme',
-            index: Math.max(0, getThemeOptions().findIndex(option => option.value === themeName)),
+            index: Math.max(0, getThemeOptions(themeHost).findIndex(option => option.value === themeName)),
           },
         })
+        return true
+      }
+      case 'color': {
+        // `/color`（CC accent，按会话持久化）：无参打开调色板选择器，
+        // `/color <name>` 直接设置，`/color status` 显示当前，`/color
+        // reset` 清除回主题默认。颜色经 `session/color` 事件按会话保存
+        // ——resume/rewind 后仍是这个会话自己的颜色（见 channel.ts）。
+        setHelpOpen(false)
+        const parts = rawInput.trim().split(/\s+/).filter(Boolean)
+        if (parts.length === 0) {
+          dispatchOverlay({
+            type: 'open',
+            overlay: {
+              kind: 'color',
+              index: Math.max(0, SESSION_COLOR_NAMES.indexOf(channel.sessionColor)),
+            },
+          })
+          return true
+        }
+        if (parts[0] === 'status') {
+          channel.pushLocal('/color', [
+            channel.sessionColor === ''
+              ? t('color-current-none')
+              : t('color-current', { name: channel.sessionColor }),
+            t('color-usage', { list: SESSION_COLOR_NAMES.join('/') }),
+          ])
+          return true
+        }
+        if (parts[0] === 'reset') {
+          channel.setSessionColor('')
+          channel.notify(t('color-reset'))
+          return true
+        }
+        const colorName = parts[0]!.toLowerCase()
+        if (!isValidSessionColor(colorName)) {
+          channel.notify(
+            t('color-unknown', { name: colorName, list: SESSION_COLOR_NAMES.join(' · ') }),
+            { color: 'error' },
+          )
+          return true
+        }
+        channel.setSessionColor(colorName)
+        channel.notify(t('color-set', { name: colorName }), { color: 'success' })
         return true
       }
       case 'new': {
         // One-shot `/new` (issue #25): the old session stays persisted and
         // is recoverable via /resume, so discarding the live view is
-        // non-destructive — no CC-style "press /new again" confirmation.
-        setHelpOpen(false)
+        // non-destructive — no CC-style "press /new again" confirmation.        setHelpOpen(false)
         void channel.newSession().then((ok) => {
           if (!ok) return
           // A new session is a fresh terminal page, not merely an emptied
@@ -1059,10 +1291,7 @@ export function Chat({
               channel.notify(t('model-unknown', { spec }), { color: 'error', timeoutMs: 8000 })
               return
             }
-            channel.notify(t('model-switching', { name: model.name }))
-            void channel.switchModel(provider, id).then((ok) => {
-              if (ok) channel.notify(t('model-switched', { name: model.name }))
-            })
+            void switchModelRecorded(provider, id, model.name)
           })
           return true
         }
@@ -1070,22 +1299,34 @@ export function Chat({
         // Opens over the cached catalog (empty cache shows the loading
         // pane); the fresh list lands with the authoritative focus, and the
         // kind-guarded set-index cannot re-focus a picker the user left.
-        dispatchOverlay({
-          type: 'open',
-          overlay: {
-            kind: 'model',
-            index: Math.max(0, models.findIndex(
-              model => model.provider === channel.provider && model.id === channel.model,
-            )),
-          },
-        })
+        // Seed-on-open: the model in use IS a use — recording it here means
+        // the recents group exists before the first post-update switch, and
+        // switching A→B keeps A in the list (the file records what was
+        // used, not only switches made after the file appeared).
+        let recentsNow = modelRecents
+        if (channel.provider !== '' && channel.model !== ''
+          && !recentsNow.some(ref => ref.provider === channel.provider && ref.id === channel.model)) {
+          recentsNow = recordModelUse({ provider: channel.provider, id: channel.model })
+          setModelRecents(recentsNow)
+        }
+        // Two-level landing: recents (when catalogued) focus their pinned
+        // row; else multi-provider catalogs focus the current provider's
+        // group row; a single-provider catalog without a meaningful recents
+        // list drills straight into its model list (pre-grouping UX).
+        {
+          const landing = modelPickerLanding(models, channel.provider, channel.model, recentsNow)
+          setModelGroup(landing.group)
+          setModelPickerDirect(landing.group !== undefined)
+          dispatchOverlay({ type: 'open', overlay: { kind: 'model', index: landing.index } })
+        }
         void channel.listModels().then((list) => {
           setModels(list)
-          const index = list.findIndex(
-            model => model.provider === channel.provider && model.id === channel.model,
-          )
-          dispatchOverlay({ type: 'set-index', kind: 'model', index: index >= 0 ? index : 0 })
+          const landing = modelPickerLanding(list, channel.provider, channel.model, recentsNow)
+          setModelGroup(landing.group)
+          setModelPickerDirect(landing.group !== undefined)
+          dispatchOverlay({ type: 'set-index', kind: 'model', index: landing.index })
         })
+        void channel.listProviders().then(setProviderInfos).catch(() => setProviderInfos([]))
         return true
       }
       case 'skills': {
@@ -1140,7 +1381,7 @@ export function Chat({
           notify: (text, options) => channel.notify(text, options),
           pushLocal: (title, lines) => channel.pushLocal(title, lines),
           working: () => channel.working,
-          switchModel: (provider, model) => channel.switchModel(provider, model),
+          switchModel: (provider, model) => switchModelRecorded(provider, model),
         }).catch(() => {
           // The wizard notifies on every handled failure; this only swallows
           // an unexpected reject so it never surfaces as an unhandled promise.
@@ -1229,6 +1470,21 @@ export function Chat({
         setHelpOpen(false)
         openRewind()
         return true
+      case 'tree': {
+        // The session family tree (pi's Session Tree): every fork branch
+        // stitched back, hover previews, per-node rewind/fork/adopt.
+        setHelpOpen(false)
+        setTreeOpen(true)
+        return true
+      }
+      case 'fork': {
+        // Tip fork (kimi-code semantics): a persisted copy of the whole
+        // conversation the user enters via /resume — the live session and
+        // its running turn stay untouched.
+        setHelpOpen(false)
+        void channel.forkSession()
+        return true
+      }
       case 'exit':
       case 'quit':
       case 'q':
@@ -1271,6 +1527,15 @@ export function Chat({
         lines.push(t('cost-note'))
         setHelpOpen(false)
         channel.pushLocal('/cost', lines)
+        return true
+      }
+      case 'balance': {
+        // DeepSeek official account balance (free read-only endpoint): the
+        // channel resolves DEEPSEEK_API_KEY through the credentials seam and
+        // queries api.deepseek.com/user/balance. The result renders as the
+        // interactive BalanceReportRow (hover for details, click to refresh).
+        setHelpOpen(false)
+        runBalance()
         return true
       }
       case 'settings': {
@@ -1331,12 +1596,16 @@ export function Chat({
         setHelpOpen(false)
         void channel.describeCredential('DEEPSEEK_API_KEY')
           .catch(() => undefined)
-          .then(status => {
+          .then(async status => {
             const keyStatus = status === undefined
               ? t('login-credentials-unavailable')
               : status.configured
                 ? t('login-key-configured', { ref: 'DEEPSEEK_API_KEY' })
                 : t('login-key-missing')
+            // OAuth account states ride along only while a dsh-auth-style
+            // plugin is mounted; absent it the lines below are exactly the
+            // pre-plugin set.
+            const oauth = await channel.oauthProviderStatuses().catch(() => undefined)
             channel.pushLocal('/login', [
               t('login-api-key', { status: keyStatus }),
               ...(status === undefined
@@ -1348,6 +1617,20 @@ export function Chat({
                     }),
                   ]),
               t('login-base-url', { url: process.env.DEEPSEEK_BASE_URL ?? t('login-official-endpoint') }),
+              ...(oauth === undefined
+                ? []
+                : [
+                    t('login-oauth-heading'),
+                    ...oauth.map(row => t('login-oauth-row', {
+                      provider: row.provider,
+                      state: row.signedIn
+                        ? t('login-oauth-in', { time: new Date(row.expiresAt ?? 0).toISOString() })
+                        : row.expired
+                          ? t('login-oauth-expired')
+                          : t('login-oauth-signed-out'),
+                    })),
+                    t('login-oauth-hint'),
+                  ]),
             ])
           })
         return true
@@ -1358,19 +1641,27 @@ export function Chat({
       case 'permission': {
         // The command itself is registered by dsh-sandbox-policy (dsh-base
         // permission-presets row): bare `/permission` opens the preset
-        // picker (read-only / workspace-write / danger-full-access) and
+        // picker and
         // Enter dispatches `/permission <preset>` through the same
         // external-command path a hand-typed argument takes. `/permission
-        // status` prints the policy explainer (absorbed from the removed
-        // `/permissions` command); other arguments pass through verbatim.
+        // status` prints the policy explainer; other arguments pass through
+        // verbatim.
         // When the row is not mounted the default external path (or the
         // model, when nothing is registered) wins.
         const mounted = channel.commandList.some(command => command.external && command.name === 'permission')
         const parts = rawInput.trim().split(/\s+/).filter(Boolean)
         if (mounted && parts[0] === 'status') {
           setHelpOpen(false)
+          const snapshot = channel.permissionPresets()
+          if (snapshot.options.some(option => option.value === 'status')) {
+            runPermissionCommand(rawInput)
+            return true
+          }
+          const currentName = snapshot.availability === 'unavailable'
+            ? t('permission-roster-unavailable')
+            : snapshot.current?.name ?? '—'
           channel.pushLocal('/permission', [
-            t('permission-current', { name: permissionPresetName(channel.mode.sandbox) }),
+            t('permission-current', { name: currentName }),
             t('permission-policy-hint'),
             t('permission-approval-hint'),
             t('permission-root-hint', { cwd: channel.cwd }),
@@ -1380,22 +1671,31 @@ export function Chat({
         }
         if (mounted && parts.length === 0) {
           setHelpOpen(false)
-          const index = (PERMISSION_PRESET_IDS as readonly string[]).indexOf(channel.mode.sandbox ?? '')
+          const snapshot = channel.permissionPresets()
+          if (snapshot.availability === 'unavailable' || snapshot.options.length === 0) {
+            runPermissionCommand(rawInput)
+            return true
+          }
+          const currentValue = snapshot.current?.kind === 'preset' ? snapshot.current.value : undefined
+          const currentIndex = currentValue === undefined
+            ? -1
+            : snapshot.options.findIndex(option => option.value === currentValue)
+          const index = currentIndex >= 0
+            ? currentIndex
+            : Math.min(1, snapshot.options.length - 1)
           dispatchOverlay({
             type: 'open',
-            overlay: { kind: 'permission', index: index >= 0 ? index : 1 },
+            overlay: {
+              kind: 'permission',
+              index,
+              snapshot: clonePermissionPresetSnapshot(snapshot),
+            },
           })
           return true
         }
         if (mounted) {
           setHelpOpen(false)
-          void channel.runExternalCommand('permission', rawInput).then((text) => {
-            if (text !== undefined && text !== '') {
-              channel.notify(text)
-            } else if (text === undefined) {
-              channel.notify(t('command-not-found', { name: 'permission' }), { color: 'error' })
-            }
-          })
+          runPermissionCommand(rawInput)
           return true
         }
         return false
@@ -1506,7 +1806,7 @@ export function Chat({
               break
             case 'model':
               if (item.route !== undefined) {
-                void channel.switchModel(item.route.provider, item.route.model)
+                void switchModelRecorded(item.route.provider, item.route.model)
               }
               break
             case 'activity':
@@ -1550,9 +1850,15 @@ export function Chat({
           onRestart()
         }
         return true
-      case 'vim':
-        channel.notify(t('vim-not-implemented'))
+      case 'vim': {
+        // `/vim`（CC vim 编辑模式）：切换输入框的 vim 编辑开关。状态在
+        // PromptInput 内部（controllerRef.toggleVim），每次切换落回 insert
+        // 子模式；Esc 进 normal、i/a/o 回 insert。会话级、不持久化。
+        setHelpOpen(false)
+        const on = promptControllerRef.current?.toggleVim() ?? false
+        channel.notify(t(on ? 'vim-on' : 'vim-off'))
         return true
+      }
       case 'terminal-setup':
         setHelpOpen(false)
         channel.pushLocal('/terminal-setup', [
@@ -1560,6 +1866,32 @@ export function Chat({
           t('terminal-paste-hint', { mod: modLabel }),
         ])
         return true
+      case 'recap': {
+        // `/recap`（pi-recap 语义）：对会话最近活动做一次无工具单轮
+        // 调用，生成一行摘要 + 建议标题。摘要是纯 UI 状态（不进 transcript
+        // 也不进 session log）；建议标题经「应用」按钮走 /rename 路径。
+        setHelpOpen(false)
+        recapAbortRef.current?.abort()
+        const controller = new AbortController()
+        recapAbortRef.current = controller
+        setRecap({ raw: '', summary: '', error: undefined, done: false, titleApplied: false, auto: false, expanded: true })
+        void channel.recapRecent({
+          signal: controller.signal,
+          onText: delta => setRecap(prev => (prev ? { ...prev, raw: prev.raw + delta } : prev)),
+        }).then(result => {
+          if (controller.signal.aborted) return
+          setRecap(prev => (prev
+            ? {
+                ...prev,
+                summary: result.summary ?? prev.raw,
+                title: result.title,
+                error: result.error,
+                done: true,
+              }
+            : prev))
+        })
+        return true
+      }
       case 'btw': {
         // CC /btw：单轮无工具侧问，overlay 态纯 UI，不打断主回合、不写
         // 会话历史。空参数只提示用法。
@@ -1602,20 +1934,6 @@ export function Chat({
         setHelpOpen(false)
         channel.pushLocal('/connect', [t('connect-none')])
         return true
-      case 'audit':
-      case 'bug':
-      case 'practice':
-      case 'review':
-      case 'pr_comments':
-      case 'release-notes':
-      case 'vuln-check': {
-        // CC's skill commands: drive the DSH skill system by sending the
-        // activation prompt to the model (it loads the skill via its skill
-        // catalog/load tools when the SKILL.md ships in ~/.dsh/skills).
-        const key = SKILL_PROMPTS[name]
-        if (key) channel.submit(t(key))
-        return true
-      }
       default: {
         // Plugin-registered command (DSH command registry): dispatch through
         // the channel, whose execution logs command/run + command/done (the
@@ -1907,6 +2225,9 @@ export function Chat({
     // so every key belongs to it — including the plain letters that drive its
     // search box, which Chat would otherwise route into the prompt.
     if (browserOpen) return
+    // Same for the session tree: plain letters drive its search, clicks and
+    // Enter drive its action menu.
+    if (treeOpen) return
     // Same for the settings screen: plain letters (s save / d discard) and
     // the field draft editor belong to it alone.
     if (settingsOpen) return
@@ -2135,25 +2456,55 @@ export function Chat({
       return
     }
     if (overlay.kind === 'model') {
+      // Two-level picker: group rows at the top (Enter drills in), one
+      // provider's models below (Enter switches, the same live-fork path as
+      // the flat picker always had). Esc/⌫ climbs one level and only closes
+      // at the top; a single-group catalog never shows the group level, so
+      // Esc there closes directly.
+      const rowCount = activeModelGroup === undefined ? modelGroups.length : groupModels.length
       if (key.upArrow || key.downArrow) {
-        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: models.length })
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: rowCount })
       } else if (plainReturn) {
-        const model = models[overlay.index]
+        if (activeModelGroup === undefined) {
+          const group = modelGroups[overlay.index]
+          if (!group) {
+            dispatchOverlay({ type: 'close' })
+            return
+          }
+          setModelGroup(group.provider)
+          // The recents group opens on its most-recent entry; a provider
+          // group on its current model when it owns one, else its first row.
+          if (group.provider === RECENTS_GROUP_PROVIDER) {
+            dispatchOverlay({ type: 'set-index', kind: 'model', index: 0 })
+            return
+          }
+          const landing = modelPickerLanding(
+            models.filter(model => model.provider === group.provider),
+            channel.provider,
+            channel.model,
+          )
+          dispatchOverlay({ type: 'set-index', kind: 'model', index: landing.index })
+          return
+        }
+        const model = groupModels[overlay.index]
         // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: out-of-range index on an empty list
         if (model) {
           // Enter switches the live model right away: the conversation is
           // forked at its end and continued with an agent routed to the new
-          // model (history replays unchanged).
+          // model (history replays unchanged) — and feeds the recents group.
           dispatchOverlay({ type: 'close' })
-          channel.notify(t('model-switching', { name: model.name }))
-          void channel.switchModel(model.provider, model.id).then((ok) => {
-            if (ok) channel.notify(t('model-switched', { name: model.name }))
-          })
+          void switchModelRecorded(model.provider, model.id, model.name)
         } else {
           dispatchOverlay({ type: 'close' })
         }
-      } else if (key.escape) {
-        dispatchOverlay({ type: 'close' })
+      } else if (key.escape || key.backspace) {
+        if (activeModelGroup !== undefined && modelGroups.length > 1 && !modelPickerDirect) {
+          setModelGroup(undefined)
+          const groupIndex = Math.max(0, modelGroups.findIndex(group => group.provider === activeModelGroup))
+          dispatchOverlay({ type: 'set-index', kind: 'model', index: groupIndex })
+        } else {
+          dispatchOverlay({ type: 'close' })
+        }
       }
       return
     }
@@ -2181,6 +2532,21 @@ export function Chat({
         const name = PRESET_NAMES[overlay.index]
         dispatchOverlay({ type: 'close' })
         if (name) channel.setActivityFrames(name)
+      } else if (key.escape) {
+        dispatchOverlay({ type: 'close' })
+      }
+      return
+    }
+    if (overlay.kind === 'color') {
+      if (key.upArrow || key.downArrow) {
+        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: SESSION_COLOR_NAMES.length })
+      } else if (plainReturn) {
+        const name = SESSION_COLOR_NAMES[overlay.index]
+        dispatchOverlay({ type: 'close' })
+        if (name) {
+          channel.setSessionColor(name)
+          channel.notify(t('color-set', { name }), { color: 'success' })
+        }
       } else if (key.escape) {
         dispatchOverlay({ type: 'close' })
       }
@@ -2215,16 +2581,18 @@ export function Chat({
     }
     if (overlay.kind === 'permission') {
       if (key.upArrow || key.downArrow) {
-        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: PERMISSION_PRESET_IDS.length })
+        const currentIndex = permissionOverlayFocusRef.current?.index ?? overlay.index
+        const nextIndex = wrapIndex(currentIndex, key.upArrow ? -1 : 1, overlay.snapshot.options.length)
+        permissionOverlayFocusRef.current = { overlay, index: nextIndex }
+        dispatchOverlay({ type: 'set-index', kind: 'permission', index: nextIndex })
       } else if (plainReturn) {
-        const id = PERMISSION_PRESET_IDS[overlay.index]
+        const currentIndex = permissionOverlayFocusRef.current?.index ?? overlay.index
+        const option = overlay.snapshot.options[currentIndex]
+        permissionOverlayFocusRef.current = null
         dispatchOverlay({ type: 'close' })
-        if (id !== undefined) {
-          void channel.runExternalCommand('permission', ` ${id}`).then((text) => {
-            if (text !== undefined && text !== '') channel.notify(text)
-          })
-        }
+        if (option !== undefined) runPermissionCommand(` ${option.value}`)
       } else if (key.escape) {
+        permissionOverlayFocusRef.current = null
         dispatchOverlay({ type: 'close' })
       }
       return
@@ -2256,7 +2624,7 @@ export function Chat({
       return
     }
     if (overlay.kind === 'theme') {
-      const options = getThemeOptions()
+      const options = getThemeOptions(themeHost)
       if (key.upArrow || key.downArrow) {
         dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: options.length })
       } else if (plainReturn) {
@@ -2439,11 +2807,14 @@ export function Chat({
         setSelectionActive(false)
         setSelectedId(null)
       }
-    } else if (key.escape && channel.working && !helpOpen) {
+    } else if (key.escape && channel.working && !helpOpen && !promptControllerRef.current?.vimActive()) {
       // CC's chat:cancel — esc interrupts a running turn (the prompt input
       // only sees esc when idle, where it has the double-tap-clear meaning).
       // With messages queued for delivery, interrupt-and-deliver them right
       // away (Codex behavior); otherwise a plain interrupt parks the queue.
+      // vim mode (either submode) yields: there Esc is a MODE key (INSERT→
+      // NORMAL, NORMAL = no-op/cancel pending d) and the prompt owns it;
+      // interrupting still works via Ctrl+C / Ctrl+Enter.
       if (channel.pending.length > 0) {
         const count = channel.interruptAndDeliver(channel.pending.map(item => item.text))
         if (count > 0) {
@@ -2488,7 +2859,27 @@ export function Chat({
       // double-press exit when the input is empty; ctrl+d keeps the
       // time-based double-press exit regardless.
       if (channel.working) {
-        channel.cancel()
+        // First press while working only interrupts. If that abort is still
+        // converging (cancelPending) the next press is the user insisting on
+        // leaving: go straight to the exit funnel. Without this, a stuck turn
+        // (long tool call that never settles, silent stream) swallows every
+        // Ctrl+C forever — raw mode keeps the launcher's SIGINT escape
+        // unreachable until the TUI exits.
+        if (channel.cancelPending) {
+          onExit()
+        } else {
+          channel.cancel()
+          // Interrupt replaces any previously armed exit: the next press
+          // must re-confirm instead of exiting out from under the turn.
+          exitPendingRef.current = false
+          if (exitTimerRef.current) clearTimeout(exitTimerRef.current)
+        }
+      } else if (input === 'c' && promptControllerRef.current?.consumeSelectionCopy()) {
+        // A mouse selection is active: Ctrl+C copies it to the clipboard
+        // (via the prompt controller — Chat's listener registers first) and
+        // KEEPS the selection for further editing. The key is consumed.
+        exitPendingRef.current = false
+        if (exitTimerRef.current) clearTimeout(exitTimerRef.current)
       } else if (input === 'c' && promptControllerRef.current?.hasText()) {
         promptControllerRef.current.clear()
         // A pending exit arm no longer makes sense once the user is editing.
@@ -2534,6 +2925,52 @@ export function Chat({
   // Working-activity line (spinner slot): context-pressure prefix shares the
   // StatusLine thresholds (amber ≥ 80, red ≥ 95).
   const activityWarnPct = contextPressurePct(channel.lastUsage, channel.contextWindow)
+
+  // ── Interrupt lane ─────────────────────────────────────────────────────
+  // The approval and ask_user_question panels park the agent until the user
+  // answers, but they render inside the conversation layout — every screen
+  // early-return below (plugin scene, browser, settings, subagent, trace)
+  // used to win over them, leaving the session stuck with no visible cause.
+  // While one is pending and a screen is up, the panel takes the whole
+  // terminal INSTEAD of the screen. The screen's open flag survives, so the
+  // decision lands back on the screen (remounted fresh — the same lifecycle
+  // as closing and reopening it); keyboard exclusivity holds because the
+  // covered screen is unmounted, exactly like the chat-state prompt slot.
+  // The panel elements are shared with the prompt-slot chain below so the
+  // two mount sites cannot drift.
+  const approvalPanelNode = approvalSnapshot !== null ? (
+    <ApprovalPanel
+      key={approvalSnapshot.key}
+      approval={approvalSnapshot}
+      onDecide={outcome => approvals.decide(outcome)}
+    />
+  ) : null
+  const questionPanelNode = questionSnapshot !== null ? (
+    <AskUserQuestionPanel
+      key={questionSnapshot.key}
+      question={questionSnapshot.question}
+      position={questionSnapshot.position}
+      total={questionSnapshot.total}
+      answered={questionSnapshot.answered}
+      initialDraft={questionSnapshot.draft}
+      onAnswer={selection => questionStore.answerCurrent(selection)}
+      onCancel={() => questionStore.cancelCurrent()}
+      onBack={questionSnapshot.canGoBack
+        ? draft => questionStore.backCurrent(draft)
+        : undefined}
+    />
+  ) : null
+  const interruptPanel = approvalPanelNode ?? questionPanelNode
+  const screenOpen = channel.pluginScene !== undefined || browserOpen || settingsOpen
+    || subagentDetailId !== null || subagentDashboardOpen || sceneOpen
+  if (interruptPanel !== null && screenOpen) {
+    const node = (
+      <Box flexDirection="column" width="100%" paddingX={1}>
+        {interruptPanel}
+      </Box>
+    )
+    return fullscreen ? node : <AlternateScreen>{node}</AlternateScreen>
+  }
 
   // A plugin scene (dsh-tui-scenes) takes the whole terminal the same way
   // the trajectory scene does, and sits at the TOP of this return chain:
@@ -2585,6 +3022,24 @@ export function Chat({
     // Inline hosts enter the alternate screen for the duration; full-screen
     // hosts are already in it and must not nest a second one.
     return fullscreen ? browser : <AlternateScreen>{browser}</AlternateScreen>
+  }
+
+  // The session tree follows the browser's rule exactly: it REPLACES the
+  // conversation (an early return after every hook above has run), so there
+  // is no transcript underneath to be repainted or bled through. The dropped
+  // turn's prompt returns through the same fill path a rewind picker uses.
+  if (treeOpen) {
+    const tree = (
+      <SessionTree
+        channel={channel}
+        currentSessionId={channel.agentId}
+        onClose={() => setTreeOpen(false)}
+        onRestoreText={(text) => {
+          setHistoryFill(text)
+        }}
+      />
+    )
+    return fullscreen ? tree : <AlternateScreen>{tree}</AlternateScreen>
   }
 
   // The settings screen follows the browser's rule exactly: it REPLACES the
@@ -2663,7 +3118,8 @@ export function Chat({
     workspaceTargetCount: workspaceTargets.length,
     effortOptionCount: effortOptions.length,
     presetOptionCount: presetOptions.length,
-  })
+  }) && !(overlay.kind === 'permission'
+    && (approvalSnapshot !== null || questionSnapshot !== null || dialogSnapshot !== null))
 
   // The sticky header pins the turn owning the viewport top row
   // (timeline.activeId, reported by MessageList) — scrolled up to an old
@@ -2736,6 +3192,7 @@ export function Chat({
           diffLayout={channel.diffLayout}
           thinkingFold={channel.thinkingFold}
           toolBackground={channel.toolBackground}
+          foldTerminalCommand={channel.foldTerminalCommand}
           activityFrames={channel.activityFrames}
           showAll={showAllMessages}
           thinkingVisible={thinkingVisible}
@@ -2831,6 +3288,24 @@ export function Chat({
           collapsed={todoCollapsed}
           onToggle={() => setTodoCollapsed(previous => !previous)}
         />
+        {recap !== null && recap.auto && !recap.expanded && (
+          <AutoRecapRow
+            summary={recap.summary}
+            streaming={!recap.done}
+            onExpand={() => setRecap(prev => (prev ? { ...prev, expanded: true } : prev))}
+            onDismiss={() => closeRecap()}
+          />
+        )}
+        {balance !== null && (
+          <BalanceReportRow
+            result={balance.result}
+            refreshing={balance.refreshing}
+            tokens={channel.tokens}
+            model={channel.model}
+            onRefresh={runBalance}
+            onDismiss={() => setBalance(null)}
+          />
+        )}
         {statusEntries.length > 0 && (
           // Plugin status contributions (tuiStatus seam): one joined line,
           // truncated by the Text wrap contract — the host owns the layout,
@@ -2839,12 +3314,8 @@ export function Chat({
             {statusEntries.map(entry => entry.text).join(' · ')}
           </Text>
         )}
-        {approvalSnapshot !== null ? (
-          <ApprovalPanel
-            key={approvalSnapshot.key}
-            approval={approvalSnapshot}
-            onDecide={outcome => approvals.decide(outcome)}
-          />
+        {approvalPanelNode !== null ? (
+          approvalPanelNode
         ) : dialogSnapshot !== null ? (
           <ExtensionDialog
             key={dialogSnapshot.key}
@@ -2855,6 +3326,35 @@ export function Chat({
         ) : overlay.kind === 'tips' ? (
           <Box flexDirection="column" marginTop={1}>
             <TipsPanel onClose={() => dispatchOverlay({ type: 'close-if', kind: 'tips' })} />
+          </Box>
+        ) : recap !== null && (!recap.auto || recap.expanded) ? (
+          <Box flexDirection="column" marginTop={1}>
+            <RecapPanel
+              summary={recap.summary}
+              title={recap.title}
+              error={recap.error}
+              streaming={!recap.done}
+              titleApplied={recap.titleApplied}
+              onClose={() => {
+                // An expanded auto recap collapses back to its dim row;
+                // a manual /recap closes outright.
+                if (recap.auto) {
+                  setRecap(prev => (prev ? { ...prev, expanded: false } : prev))
+                } else {
+                  closeRecap()
+                }
+              }}
+              onCopy={() => {
+                void setClipboard(recap.summary ?? '').then(raw => { if (raw) writeRaw?.(raw) })
+                channel.notify(t('copied-chars', { n: (recap.summary ?? '').length }), { timeoutMs: 1500 })
+              }}
+              onApplyTitle={() => {
+                if (recap.title === undefined || recap.titleApplied) return
+                channel.renameSession(recap.title)
+                setRecap(prev => (prev ? { ...prev, titleApplied: true } : prev))
+                channel.notify(t('recap-title-applied-notify', { title: recap.title }), { color: 'success' })
+              }}
+            />
           </Box>
         ) : btw !== null ? (
           <Box flexDirection="column" marginTop={1}>
@@ -2870,20 +3370,8 @@ export function Chat({
               }}
             />
           </Box>
-        ) : questionSnapshot !== null ? (
-          <AskUserQuestionPanel
-            key={questionSnapshot.key}
-            question={questionSnapshot.question}
-            position={questionSnapshot.position}
-            total={questionSnapshot.total}
-            answered={questionSnapshot.answered}
-            initialDraft={questionSnapshot.draft}
-            onAnswer={selection => questionStore.answerCurrent(selection)}
-            onCancel={() => questionStore.cancelCurrent()}
-            onBack={questionSnapshot.canGoBack
-              ? draft => questionStore.backCurrent(draft)
-              : undefined}
-          />
+        ) : questionPanelNode !== null ? (
+          questionPanelNode
         ) : (
           <PromptInput
             channel={channel}
@@ -2981,20 +3469,44 @@ export function Chat({
             <Box flexDirection="column" marginTop={1}>
               {models.length === 0 ? (
                 <ModelPickerLoading />
+              ) : activeModelGroup === undefined ? (
+                <ModelPicker
+                  groups={modelGroups}
+                  focusIndex={overlay.index}
+                  currentProvider={channel.provider}
+                  onPick={(index) => {
+                    // 点击分组行 = 进入该组（与 Enter 同一条路径）
+                    const group = modelGroups[index]
+                    if (!group) return
+                    setModelGroup(group.provider)
+                    if (group.provider === RECENTS_GROUP_PROVIDER) {
+                      dispatchOverlay({ type: 'set-index', kind: 'model', index: 0 })
+                      return
+                    }
+                    const landing = modelPickerLanding(
+                      models.filter(model => model.provider === group.provider),
+                      channel.provider,
+                      channel.model,
+                    )
+                    dispatchOverlay({ type: 'set-index', kind: 'model', index: landing.index })
+                  }}
+                />
               ) : (
                 <ModelPicker
-                  models={models}
+                  models={groupModels}
+                  groupLabel={activeModelGroup === RECENTS_GROUP_PROVIDER
+                    ? t('picker-group-recent')
+                    : modelGroups.find(group => group.provider === activeModelGroup)?.label}
+                  showBack={modelGroups.length > 1 && !modelPickerDirect}
+                  showProviderPrefix={activeModelGroup === RECENTS_GROUP_PROVIDER}
                   focusIndex={overlay.index}
                   currentModel={`${channel.provider}/${channel.model}`}
                   onPick={(index) => {
                     // 点击行 = 应用该行模型（与 Enter 同一条路径）
-                    const model = models[index]
+                    const model = groupModels[index]
                     if (!model) return
                     dispatchOverlay({ type: 'close' })
-                    channel.notify(t('model-switching', { name: model.name }))
-                    void channel.switchModel(model.provider, model.id).then((ok) => {
-                      if (ok) channel.notify(t('model-switched', { name: model.name }))
-                    })
+                    void switchModelRecorded(model.provider, model.id, model.name)
                   }}
                 />
               )}
@@ -3031,6 +3543,22 @@ export function Chat({
               />
             </Box>
           )}
+          {overlay.kind === 'color' && (
+            <Box flexDirection="column" marginTop={1}>
+              <ColorPicker
+                focusIndex={overlay.index}
+                currentColor={channel.sessionColor}
+                onPick={(index) => {
+                  dispatchOverlay({ type: 'close' })
+                  const name = SESSION_COLOR_NAMES[index]
+                  if (name) {
+                    channel.setSessionColor(name)
+                    channel.notify(t('color-set', { name }), { color: 'success' })
+                  }
+                }}
+              />
+            </Box>
+          )}
           {overlay.kind === 'effort' && effortOptions.length > 1 && (
             <Box flexDirection="column" marginTop={1}>
               <EffortSlider
@@ -3060,20 +3588,18 @@ export function Chat({
               />
             </Box>
           )}
-          {overlay.kind === 'permission' && (
+          {overlay.kind === 'permission' && overlay.snapshot.options.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
               <PermissionsPicker
+                options={overlay.snapshot.options}
                 focusIndex={overlay.index}
-                currentMode={channel.mode.sandbox}
+                currentValue={overlay.snapshot.current?.value}
                 cwd={channel.cwd}
                 onPick={(index) => {
+                  if (approvalSnapshot !== null || questionSnapshot !== null || dialogSnapshot !== null) return
+                  const option = overlay.snapshot.options[index]
                   dispatchOverlay({ type: 'close' })
-                  const id = PERMISSION_PRESET_IDS[index]
-                  if (id !== undefined) {
-                    void channel.runExternalCommand('permission', ` ${id}`).then((text) => {
-                      if (text !== undefined && text !== '') channel.notify(text)
-                    })
-                  }
+                  if (option !== undefined) runPermissionCommand(` ${option.value}`)
                 }}
               />
             </Box>
@@ -3112,9 +3638,10 @@ export function Chat({
               <ThemePicker
                 focusIndex={overlay.index}
                 currentTheme={themeName}
+                themeHost={themeHost}
                 onPick={(index) => {
                   dispatchOverlay({ type: 'close' })
-                  const name = getThemeOptions()[index]?.value
+                  const name = getThemeOptions(themeHost)[index]?.value
                   if (name !== undefined) {
                     const ok = setTheme(name)
                     channel.notify(
@@ -3195,6 +3722,19 @@ export function Chat({
         </OverlayAbove>
         )}
       </Box>
+      {/* Tooltip 悬停浮层：absolute 零布局高度，挂在根 Box 最后确保盖在
+          其余内容之上（yoga 的 absolute 相对父级，根 Box 原点即屏原点，
+          指针 anchor 的屏幕坐标可直接使用）。订阅模块级 store，锚点/
+          内容由各处的 useTooltip hover props 写入；resize 时自行隐藏
+          （几何失效）。 */}
+      <TooltipLayer
+        invalidationKey={`${overlay.kind}:${dialogOverlayOpen}:${btw !== null}`}
+        subscribeInvalidation={subscribeTooltipInvalidation}
+      />
+      {/* 全屏草稿编辑浮层：必须挂在 TooltipLayer 之后（树序最后），
+          才能盖住包括状态栏在内的全部后绘兄弟。内容由 PromptInput
+          经 module store 发布（见 PromptEditor.tsx）。 */}
+      <PromptEditorLayer />
     </Box>
   )
 }

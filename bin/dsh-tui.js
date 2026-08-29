@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-tui — 双态启动器（delegating launcher，0.9.0）。
+ * dsh-tui — 双态启动器（delegating launcher，0.9.3）。
  *
  * 同一个文件按“自己住在哪”决定扮演的角色：
  *
@@ -28,13 +28,29 @@
  * `DSH_TUI_LANG` 显式指定时从其值，否则默认中文（同 src/i18n.ts 的缺省）。
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+if (process.platform === 'win32' && process.env.DSH_TUI_STANDALONE_BINARY) {
+  try {
+    const oldBinary = `${process.env.DSH_TUI_STANDALONE_BINARY}.old`
+    if (existsSync(oldBinary)) rmSync(oldBinary, { force: true })
+  } catch {
+    // Best effort cleanup.
+  }
+}
+
 const here = dirname(fileURLToPath(import.meta.url))
 const ownDir = dirname(here)
+
+/**
+ * Read and parse a JSON file safely.
+ *
+ * @param {string} p - File path to parse.
+ * @returns {any} Parsed JSON content or undefined.
+ */
 const readJson = p => {
   try {
     return JSON.parse(readFileSync(p, 'utf8'))
@@ -50,6 +66,12 @@ const PROFILE = 'dsh-tui'
 // --- 内联小工具（见文件头：零 lib 依赖是迁移契约的一部分）---------------------
 // 与 lib/types/utils/shellQuote.js 同语义的最小实现：cmd.exe 以空格拼接参数
 // 且不做转义，含空格/引号的参数必须整体加引号（内层引号与反斜杠转义）。
+/**
+ * Quote an array of arguments for cmd.exe.
+ *
+ * @param {string[]} args - Argument tokens.
+ * @returns {string[]} Quoted argument tokens.
+ */
 const shellQuote = args =>
   args.map(arg => {
     const s = String(arg)
@@ -156,6 +178,30 @@ const MSG = {
     en: '(not installed)',
     zh: '（未安装）',
   },
+  doctorLabels: {
+    en: {
+      dshMissing: 'not found — install it first:  npm install -g @deepseek-ai/dsh',
+      pnpmMissing: 'not found — needed for install/update:  npm install -g pnpm',
+      profileMissing: 'not installed — run `dsh-tui` once to bootstrap it',
+      aligned: 'aligned',
+      profileNewer: v => `profile is newer — align the launcher:  npm install -g ${PACKAGE}@${v}`,
+      profileOlder: v => `profile is older — align it:  dsh plugin --profile ${PROFILE} add ${PACKAGE}@${v}`,
+      keySet: 'set',
+      keyMissing: 'not set — interactive launch reads DEEPSEEK_API_KEY',
+      missing: 'missing',
+    },
+    zh: {
+      dshMissing: '未找到——请先安装：  npm install -g @deepseek-ai/dsh',
+      pnpmMissing: '未找到——安装/升级需要它：  npm install -g pnpm',
+      profileMissing: '未安装——运行一次 `dsh-tui` 即可自举',
+      aligned: '已对齐',
+      profileNewer: v => `profile 较新——对齐启动器：  npm install -g ${PACKAGE}@${v}`,
+      profileOlder: v => `profile 较旧——对齐它：  dsh plugin --profile ${PROFILE} add ${PACKAGE}@${v}`,
+      keySet: '已设置',
+      keyMissing: '未设置——交互启动读取 DEEPSEEK_API_KEY',
+      missing: '缺失',
+    },
+  },
   updateUnavailable: {
     en:
       `[dsh-tui] \`update\` needs the profile's compiled copy, but it is missing or too old to carry the CLI entry.\n` +
@@ -166,9 +212,10 @@ const MSG = {
   },
   helpText: {
     en:
-      `Usage: dsh-tui [command] [options] [path|url]\n\n` +
+      `Usage: dsh-tui|dst [command] [options] [path|url]\n\n` +
       `Commands:\n` +
       `  update                 Update the ${PROFILE} profile to the latest release\n` +
+      `  doctor                 Pre-flight environment checks (dsh/pnpm/profile/key)\n` +
       `  version                Show launcher and profile versions\n` +
       `  help                   Show this help\n\n` +
       `Options:\n` +
@@ -177,9 +224,10 @@ const MSG = {
       `  <path|url>             Open with the given workspace target\n\n` +
       `Any other argument is forwarded to \`dsh --profile ${PROFILE}\`.`,
     zh:
-      `用法：dsh-tui [命令] [选项] [路径|URL]\n\n` +
+      `用法：dsh-tui|dst [命令] [选项] [路径|URL]\n\n` +
       `命令：\n` +
       `  update                 将 ${PROFILE} profile 升级到最新版本\n` +
+      `  doctor                 启动前环境诊断（dsh/pnpm/profile/密钥）\n` +
       `  version                显示启动器与 profile 版本\n` +
       `  help                   显示本帮助\n\n` +
       `选项：\n` +
@@ -226,6 +274,60 @@ if (subcommand === 'version' || subcommand === '--version' || subcommand === '-v
 if (subcommand === 'help' || subcommand === '--help' || subcommand === '-h') {
   console.log(msg('helpText'))
   process.exit(0)
+}
+// ─── 子命令：doctor ──────────────────────────────────────────────────────────
+// 启动前环境诊断——针对「TUI 起不来」的故障域（装不上、update 后版本不
+// 同步、密钥没配），与 TUI 内 /doctor 的会话内诊断互补。零 lib 依赖、
+// 不委托、不自举：profile 残缺时它必须还能跑。密钥红线：只报告是否已
+// 设置，绝不输出值。仅 dsh 缺失记为硬失败（其余检查全部照常打印后再
+// 以退出码 1 收束）。
+if (subcommand === 'doctor') {
+  const L = msg('doctorLabels')
+  let hardFailure = false
+  const report = (ok, label, detail) => console.log(`${ok ? '✓' : '✗'} ${label}: ${detail}`)
+  console.log(`dsh-tui doctor · ${PACKAGE} ${ownVersion ?? 'unknown'}`)
+  report(true, 'node', `${process.version} · ${process.platform} ${process.arch}`)
+  const probeVersion = command => {
+    const probe = spawnSync(...cmd(command, ['--version']), { stdio: 'pipe', encoding: 'utf8', ...shellOpt })
+    if (probe.error || probe.status !== 0) return undefined
+    // 白名单校验：只回显版本号形状的首行。诊断输出的红线是绝不泄露密钥，
+    // 而 PATH 上的 wrapper 理论上可以把任意环境变量 echo 进 --version——
+    // 不匹配版本形状的输出一律不转印。
+    const line = String(probe.stdout ?? '').trim().split('\n')[0] ?? ''
+    return /^v?\d[\w.+-]*$/.test(line) ? line : '(version unreadable)'
+  }
+  const dshVersion = probeVersion('dsh')
+  if (dshVersion === undefined) {
+    hardFailure = true
+    report(false, 'dsh', L.dshMissing)
+  } else {
+    report(true, 'dsh', dshVersion)
+  }
+  const pnpmVersion = probeVersion('pnpm')
+  report(pnpmVersion !== undefined, 'pnpm', pnpmVersion ?? L.pnpmMissing)
+  const profileVersion = readJson(installedPkgPath)?.version
+  if (profileVersion === undefined) {
+    report(false, 'profile', `${L.profileMissing}  (${profileDir})`)
+  } else {
+    report(true, 'profile', `${profileVersion}  (${profileDir})`)
+    if (ownVersion !== undefined && !runningInsideProfile) {
+      if (profileVersion === ownVersion) {
+        report(true, 'launcher ↔ profile', L.aligned)
+      } else if (isVersionNewer(profileVersion, ownVersion)) {
+        report(false, 'launcher ↔ profile', L.profileNewer(profileVersion))
+      } else {
+        report(false, 'launcher ↔ profile', L.profileOlder(ownVersion))
+      }
+    }
+  }
+  // truthiness 而非 !== undefined：空字符串的 key 同样发不了请求，且 TUI 内
+  // /doctor（channel.doctorInfo）按 truthiness 报告——两个 doctor 不许分叉。
+  const keySet = Boolean(process.env.DEEPSEEK_API_KEY)
+  report(keySet, 'DEEPSEEK_API_KEY', keySet ? L.keySet : L.keyMissing)
+  for (const candidate of [join(homedir(), '.dsh-tui', 'cordis.yml'), join(profileDir, 'cordis.patch.yml')]) {
+    report(existsSync(candidate), 'config', `${candidate}${existsSync(candidate) ? '' : `  ${L.missing}`}`)
+  }
+  process.exit(hardFailure ? 1 : 0)
 }
 
 const forwardExit = child => {

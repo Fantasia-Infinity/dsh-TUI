@@ -46,15 +46,22 @@ const {
   isEexistTmpRenameFailure,
   profilePackageDir,
   removeStalePackageInstall,
+  ensureProfileAllowBuilds,
+  profileWorkspaceYamlPath,
+  isStandaloneRuntime,
+  getStandaloneBinaryPath,
+  getStandaloneAssetName,
 } = await import('../lib/types/update.js')
 const compiledModulePath = fileURLToPath(new URL('../lib/types/update.js', import.meta.url))
 const compiledShellQuotePath = fileURLToPath(new URL('../lib/types/utils/shellQuote.js', import.meta.url))
 const compiledPathsPath = fileURLToPath(new URL('../lib/types/utils/paths.js', import.meta.url))
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 
-// The compiled update.js imports ./utils/shellQuote.js and ./utils/paths.js
-// (the /restart log lives under DATA_DIR) — mirror all three into every
-// scratch layout or the import dies with ERR_MODULE_NOT_FOUND.
+/**
+ * Mirror compiled update module and its dependencies into a scratch directory.
+ *
+ * @param {string} dstDir - Destination directory to receive the modules.
+ */
 function copyUpdateModule(dstDir) {
   mkdirSync(join(dstDir, 'utils'), { recursive: true })
   cpSync(compiledModulePath, join(dstDir, 'update.js'))
@@ -229,6 +236,94 @@ check(
   ]),
   `got ${JSON.stringify(fallbackUpdateArgs)}`,
 )
+
+// ---- pnpm allowBuilds pre-seed: pnpm ≥11 kills installs whose tree carries
+// un-allowlisted build scripts (ERR_PNPM_IGNORED_BUILDS); the update flow
+// must seed the profile workspace with explicit `false` entries first.
+{
+  const DSH_HOME_BACKUP = process.env.DSH_HOME
+  const allowScratch = mkdtempSync(join(tmpdir(), 'verify-allowbuilds-'))
+  const profileRoot = join(allowScratch, 'profiles', 'tui')
+  try {
+    process.env.DSH_HOME = allowScratch
+    mkdirSync(profileRoot, { recursive: true })
+    const yamlPath = profileWorkspaceYamlPath('tui')
+
+    // Case 1: no workspace file yet → created with all four entries.
+    let outcome = ensureProfileAllowBuilds('tui')
+    check(
+      'allowBuilds: missing file is created with all entries',
+      outcome !== undefined && outcome.added.length === 4 && existsSync(yamlPath),
+      JSON.stringify(outcome),
+    )
+    let text = readFileSync(yamlPath, 'utf8')
+    check(
+      'allowBuilds: file contains the four false entries',
+      /'@google\/genai': false/u.test(text) && /esbuild: false/u.test(text) &&
+        /koffi: false/u.test(text) && /protobufjs: false/u.test(text),
+      text,
+    )
+
+    // Case 2: idempotent — a second run adds nothing and leaves the file alone.
+    const before = readFileSync(yamlPath, 'utf8')
+    outcome = ensureProfileAllowBuilds('tui')
+    check(
+      'allowBuilds: second run is a no-op',
+      outcome !== undefined && outcome.added.length === 0 && readFileSync(yamlPath, 'utf8') === before,
+      JSON.stringify(outcome),
+    )
+
+    // Case 3: an existing file without an allowBuilds block keeps its content.
+    const legacyYaml = join(profileRoot, 'pnpm-workspace.yaml')
+    writeFileSync(legacyYaml, 'packages:\n  - .\n\nnodeLinker: hoisted\n')
+    outcome = ensureProfileAllowBuilds('tui')
+    text = readFileSync(legacyYaml, 'utf8')
+    check(
+      'allowBuilds: block appended, existing keys preserved',
+      outcome !== undefined && outcome.added.length === 4 &&
+        text.startsWith('packages:\n  - .\n\nnodeLinker: hoisted\n') &&
+        text.includes('allowBuilds:') && /protobufjs: false/u.test(text),
+      text,
+    )
+
+    // Case 4: a partial block is completed without touching existing entries
+    // (an explicit user `true`/`false` decision wins).
+    writeFileSync(legacyYaml, "allowBuilds:\n  '@google/genai': true\n  esbuild: false\n")
+    outcome = ensureProfileAllowBuilds('tui')
+    text = readFileSync(legacyYaml, 'utf8')
+    check(
+      'allowBuilds: missing entries appended, existing values untouched',
+      outcome !== undefined && outcome.added.length === 2 &&
+        outcome.existing.includes('@google/genai') && outcome.existing.includes('esbuild') &&
+        /'@google\/genai': true/u.test(text) && /koffi: false/u.test(text) && /protobufjs: false/u.test(text),
+      `${JSON.stringify(outcome)} :: ${text}`,
+    )
+
+    // Case 5: entries in the middle of the file (other top-level keys after
+    // the block) still insert inside the block, after existing entries.
+    writeFileSync(legacyYaml, 'packages: []\nallowBuilds:\n  esbuild: false\nminimumReleaseAgeExclude:\n  - x@1.0.0\n')
+    outcome = ensureProfileAllowBuilds('tui')
+    text = readFileSync(legacyYaml, 'utf8')
+    check(
+      'allowBuilds: insertion stays inside the block before later keys',
+      outcome !== undefined && outcome.added.length === 3 &&
+        /allowBuilds:\n  esbuild: false\n  '@google\/genai': false\n  koffi: false\n  protobufjs: false\nminimumReleaseAgeExclude:/u.test(text),
+      text,
+    )
+
+    // Case 6: missing profile directory → undefined, nothing written.
+    outcome = ensureProfileAllowBuilds('missing-profile')
+    check(
+      'allowBuilds: absent profile directory yields undefined',
+      outcome === undefined,
+      JSON.stringify(outcome),
+    )
+  } finally {
+    if (DSH_HOME_BACKUP === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = DSH_HOME_BACKUP
+    rmSync(allowScratch, { recursive: true, force: true })
+  }
+}
 
 // ---- isBootDeadlockTarget: the 0.7.0–0.7.1 hard-inject range only
 check('deadlock: 0.7.0 is refused', isBootDeadlockTarget('0.7.0'))
@@ -479,8 +574,18 @@ check(
     mkdirSync(stubDir, { recursive: true })
     writeFileSync(join(stubDir, 'dsh'), '#!/bin/sh\nexit 0\n')
     chmodSync(join(stubDir, 'dsh'), 0o755)
+    // Windows spawns the launcher through cmd.exe (shell: true), which does
+    // not run sh scripts — provide a .cmd stub that exits 0 as well.
+    writeFileSync(join(stubDir, 'dsh.cmd'), '@exit /b 0\r\n')
+    // Isolate the profile workspace: ensureProfileAllowBuilds inside
+    // updateTui must touch this scratch home, never the real ~/.dsh.
+    const DSH_HOME_BACKUP = process.env.DSH_HOME
+    process.env.DSH_HOME = join(scratch3, 'home')
     process.env.NPM_CONFIG_REGISTRY = 'http://127.0.0.1:1'
-    delete process.env.npm_config_registry
+    // NOTE: no `delete process.env.npm_config_registry` here — Windows env
+    // vars are case-insensitive, so deleting the lowercase spelling would
+    // also drop the uppercase value just set, silently pointing the probe at
+    // the real npmjs registry (and making this test network-dependent).
     process.env.PATH = stubDir
     const cliMod = await import(`${pathToFileURL(join(pkgRoot, 'lib', 'types', 'update.js'))}?probe=cli`)
     let captured = ''
@@ -492,6 +597,8 @@ check(
     } finally {
       process.stdout.write = origWrite
     }
+    if (DSH_HOME_BACKUP === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = DSH_HOME_BACKUP
     check('cli: no-op --latest 兜底以 0 退出', code === 0, `code=${code}`)
     check('cli: 版本未前进时如实提示', captured.includes('version did not advance'), JSON.stringify(captured.slice(0, 120)))
     check('cli: 不打印虚假的 updated X → X', !captured.includes('updated 2.0.0'))
@@ -505,8 +612,50 @@ check(
   }
 }
 
+// ---- standalone: 便携包环境检测与资产名称解析 --------------------------------
+{
+  const origEnv = {
+    standalone: process.env.DSH_TUI_STANDALONE,
+    binary: process.env.DSH_TUI_STANDALONE_BINARY,
+    dshHome: process.env.DSH_HOME,
+  }
+  try {
+    delete process.env.DSH_TUI_STANDALONE
+    delete process.env.DSH_TUI_STANDALONE_BINARY
+    process.env.DSH_HOME = '/home/user/.dsh'
+    check('standalone: 默认非便携模式', isStandaloneRuntime() === false)
+
+    process.env.DSH_TUI_STANDALONE = '1'
+    check('standalone: DSH_TUI_STANDALONE=1 识别为便携模式', isStandaloneRuntime() === true)
+
+    delete process.env.DSH_TUI_STANDALONE
+    process.env.DSH_TUI_STANDALONE_BINARY = '/tmp/dsh-tui'
+    check('standalone: DSH_TUI_STANDALONE_BINARY 识别为便携模式', isStandaloneRuntime() === true)
+    check('standalone: getStandaloneBinaryPath 返回指定路径', getStandaloneBinaryPath() === '/tmp/dsh-tui')
+
+    delete process.env.DSH_TUI_STANDALONE_BINARY
+    process.env.DSH_HOME = '/home/user/.dsh-tui-standalone'
+    check('standalone: DSH_HOME 包含 dsh-tui-standalone 识别为便携模式', isStandaloneRuntime() === true)
+
+    // 资产名称匹配
+    check('standalone: Windows 资产名匹配', getStandaloneAssetName('win32', 'x64') === 'dsh-tui-standalone-win-x64.zip')
+    check('standalone: macOS arm64 资产名匹配', getStandaloneAssetName('darwin', 'arm64') === 'dsh-tui-standalone-darwin-arm64.tar.gz')
+    check('standalone: macOS x64 资产名匹配', getStandaloneAssetName('darwin', 'x64') === 'dsh-tui-standalone-darwin-x64.tar.gz')
+    check('standalone: Linux x64 资产名匹配', getStandaloneAssetName('linux', 'x64') === 'dsh-tui-standalone-linux-x64.tar.gz')
+    check('standalone: Linux arm64 资产名匹配', getStandaloneAssetName('linux', 'arm64') === 'dsh-tui-standalone-linux-arm64.tar.gz')
+  } finally {
+    if (origEnv.standalone === undefined) delete process.env.DSH_TUI_STANDALONE
+    else process.env.DSH_TUI_STANDALONE = origEnv.standalone
+    if (origEnv.binary === undefined) delete process.env.DSH_TUI_STANDALONE_BINARY
+    else process.env.DSH_TUI_STANDALONE_BINARY = origEnv.binary
+    if (origEnv.dshHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = origEnv.dshHome
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`)
   process.exit(1)
 }
 console.log('\nall checks passed')
+

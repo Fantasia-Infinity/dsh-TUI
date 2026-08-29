@@ -20,7 +20,7 @@
  */
 process.env.FORCE_COLOR = '3'
 
-const [{ PassThrough, Writable }, React, { render }, { Chat }, { QuestionStore }, { Terminal: XTerm }, fs] =
+const [{ PassThrough, Writable }, React, { render }, { Chat }, { QuestionStore }, { Terminal: XTerm }, fs, { writeParsed, viewportLines, sleep }] =
   await Promise.all([
     import('node:stream'),
     import('react'),
@@ -29,6 +29,7 @@ const [{ PassThrough, Writable }, React, { render }, { Chat }, { QuestionStore }
     import('../src/dsh-adapter/questions.js'),
     import('@xterm/headless'),
     import('node:fs'),
+    import('./lib/term-test.mjs'),
   ])
 
 const COLS = Number(process.env.COLS ?? 100)
@@ -123,8 +124,9 @@ const instance = await render(
   },
 )
 
-// 启动稳定
-await new Promise(r => setTimeout(r, 500))
+// 启动稳定：让 spinner 先空转若干 50ms 动画帧——动画重绘本身是被测对象，
+// 固定墙钟 pacing 是场景的一部分，无可轮询的完成条件。
+await sleep(500)
 
 // 流式灌文本 ~6 秒（thinking 状态保持）。内容刻意全为中文、不含 'thinking'
 // 与孤立 ASCII 't'，让残影断言无歧义。
@@ -138,11 +140,13 @@ const CHUNKS = [
 ]
 for (const chunk of CHUNKS) {
   pushChunk(chunk)
-  await new Promise(r => setTimeout(r, 120))
+  // 120ms 是场景 pacing：流式增长与 50ms 动画帧交错才能诱发残影，
+  // 不是在等某个可观测状态。
+  await sleep(120)
 }
 
-// 再让 spinner 空转几帧
-await new Promise(r => setTimeout(r, 800))
+// 再让 spinner 空转几帧（墙钟 pacing：残影需要多帧重绘才会显形）
+await sleep(800)
 
 const byteStream = stdout.frames.join('')
 try { instance.unmount() } catch {}
@@ -151,16 +155,12 @@ try { instance.unmount() } catch {}
 // write 是异步分块解析的：必须等回调而不是固定 sleep，否则慢机器上
 // 断言读到解析了一半的屏幕。
 const term = new XTerm({ cols: COLS, rows: ROWS, scrollback: 500, allowProposedApi: true })
-await new Promise<void>(r => term.write(byteStream, r))
+await writeParsed(term, byteStream)
 
 // 扫可见视口（baseY 起的 ROWS 行）。裸 getLine(0..ROWS) 在有 scrollback 时
 // 读的是缓冲区开头：混入已滚出的旧行、漏掉视口底部 baseY 行——残影恰恰
 // 最容易出现在底部 spinner 附近。
-const buf = term.buffer.active
-const lines: string[] = []
-for (let y = 0; y < ROWS; y++) {
-  lines.push(buf.getLine(buf.baseY + y)?.translateToString(true) ?? '')
-}
+const lines = viewportLines(term, ROWS)
 
 // ── 残影检测 ──
 const problems: string[] = []
@@ -184,7 +184,7 @@ if (problems.length > 0) {
   const dump = '/tmp/repro-thinking-frames.bin'
   fs.writeFileSync(dump, byteStream)
   console.error(`FAIL: thinking spinner 残影回归（帧字节已存 ${dump}）`)
-  console.error(`=== xterm-headless replay: ${COLS}x${ROWS} (viewport baseY=${buf.baseY}) ===`)
+  console.error(`=== xterm-headless replay: ${COLS}x${ROWS} (viewport baseY=${term.buffer.active.baseY}) ===`)
   lines.forEach((line, y) => console.error(`${String(y).padStart(3)}|${line}`))
   for (const p of problems) console.error(`- ${p}`)
   process.exit(1)
