@@ -1,7 +1,7 @@
 /**
  * dsh-tui plugin entry. The TUI implementation lives in `./plugin.tsx` (its
  * render path is JSX); this module owns the plugin surface (`name`/`inject`/
- * `Config`/`apply`) at the canonical `src/index.ts` location and delegates
+ * `Config`/`apply`) at the package entry module and delegates
  * `apply` through a dynamic import so entry-scanning tooling and the Loader
  * resolve a plain `.ts` module.
  * @module @deepseek-harness-tui/dsh-tui
@@ -9,7 +9,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import type { SessionModeSpec } from '../sessionModes.js'
-import { DEFAULT_STATUS_BAR, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
+import { DEFAULT_STATUS_BAR, normalizePageMargin, type PageMarginSetting, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
 import { SHORTCUT_ACTIONS, type ShortcutActionId } from '../utils/keymap.js'
 
 export const name = 'dsh-tui'
@@ -56,21 +56,25 @@ export interface Config {
   effort?: string
   /** Show the live working line derived in-process from base session events. */
   activity?: boolean
-  /** Working-activity indicator preset: `claude`/`moon`/`comet`/`dots`/…
-   *  or `random` (see activityFrames.ts). When absent, the `/activity`
+  /** Working-activity indicator preset (`moon8`/`moon`/`comet`/`dots`/…
+   *  or `random`; see activityFrames.ts). When absent, the `/activity`
    *  choice persisted in `~/.dsh-tui/working-activity.json` wins, then the
-   *  `claude` default. */
+   *  `moon8` default. */
   activityFrames?: string
   /** Show the segmented context bar (the band under the input with the
    *  `ctx used/window` readout) in the status footer; off hides that row
    *  while the status/mode lines stay (issue #29). */
   contextBar?: boolean
-  /** Run in the terminal's alternate screen (Claude Code fullscreen layout).
+  /** Run in the terminal's alternate screen (full-screen terminal layout).
    *  Defaults to true — the fullscreen surface is the more complete one
    *  (mouse, timeline rail, scrollbar gutter, selection copy), so fresh
    *  installs start there; cordis.yml `fullscreen: false` or a /settings
    *  toggle opts back into the inline main-screen layout. */
   fullscreen?: boolean
+  /** Allow terminal image previews when supported (default true). Saved
+   *  /settings choices override this value after restart. The environment
+   *  override DSH_TUI_DISABLE_TERMINAL_IMAGES can always force previews off. */
+  terminalImages?: boolean
   /** UI language: `en` / `zh`. When absent, the `DSH_TUI_LANG` env var wins,
    *  then the `/lang` choice persisted in `~/.dsh-tui/lang.json`, then `zh`. */
   lang?: string
@@ -93,6 +97,12 @@ export interface Config {
    *  `dsh-tui.scrollGutter`): `timeline` turn rail (default), `scrollbar`
    *  proportional thumb, or `hidden`. */
   scrollGutter?: ScrollGutterMode
+  /** Root page inset (settings `dsh-tui.pageMargin`): a preset name
+   *  (`none` / `slim` / `normal` (default) / `roomy`) or a custom `NxM`
+   *  spec (columns per side × rows top/bottom) that insets the whole UI
+   *  from the terminal edges. Terminals without their own viewport padding
+   *  (bare WSL, tmux, SSH) otherwise hug the screen border. */
+  pageMargin?: PageMarginSetting
   /** Terminal-card header folding (settings `dsh-tui.foldTerminalCommand`):
    *  `true` collapses a multi-line command title to its first line plus a
    *  `+N lines` hint; Ctrl+O / clicking the card expands it. Default off —
@@ -114,7 +124,7 @@ export interface Config {
   /** Status-footer field visibility and compact presentation preferences. */
   statusBar?: Partial<StatusBarConfig>
   /** Built-in action-shortcut overrides (`paste: 'alt+v'`), keyed by action
-   *  id (see src/utils/keymap.ts). Combos are `ctrl+`/`alt+`/`shift+` plus a
+   *  id (see the keymap utility). Combos are `ctrl+`/`alt+`/`shift+` plus a
    *  key; several combos may be comma-separated. Unset actions keep their
    *  defaults; the `/settings` screen edits the same keys live (its user
    *  layer wins over this file). */
@@ -141,12 +151,20 @@ export const Config: Schema<Config> = Schema.object({
   activityFrames: Schema.string().required(false),
   contextBar: Schema.boolean().default(true),
   fullscreen: Schema.boolean().default(true),
+  terminalImages: Schema.boolean().default(true),
   lang: Schema.string().required(false),
   preset: Schema.string().required(false),
   diffLayout: Schema.union(['auto', 'split', 'unified']).default('auto'),
   thinkingFold: Schema.union(['preview', 'full']).default('preview'),
   toolBackground: Schema.union(['none', 'subtle', 'strong']).default('none'),
   scrollGutter: Schema.union(['timeline', 'scrollbar', 'hidden']).default('timeline'),
+  // Preset names AND custom `NxM` specs must survive validation (a custom
+  // spec is not a fixed union member); junk is normalized to `normal` by
+  // the transform, so every parsed config carries a valid setting.
+  pageMargin: Schema.transform(
+    Schema.string().default('normal'),
+    value => normalizePageMargin(value),
+  ),
   foldTerminalCommand: Schema.boolean().default(false),
   promptSessionLabel: Schema.boolean().default(false),
   expandEditor: Schema.boolean().default(true),
@@ -182,6 +200,7 @@ export const Config: Schema<Config> = Schema.object({
       plan: Schema.boolean().required(false),
       sandbox: Schema.union(['read-only', 'workspace-write', 'danger-full-access']).required(false),
       approval: Schema.union(['ask', 'never']).required(false),
+      permission: Schema.string().required(false),
     }),
   ).required(false),
 })
@@ -200,6 +219,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // natural-language notice now renders in the logo header under the
   // startup tip (LogoV2 ← upstreamDriftSummary); CI keeps the hard gate
   // via scripts/verify-upstream-contract.ts.
-  const { apply: ccTuiApply } = await import('./plugin.js')
-  return ccTuiApply(ctx, config)
+  const { apply: tuiApply } = await import('./plugin.js')
+  return tuiApply(ctx, config)
 }

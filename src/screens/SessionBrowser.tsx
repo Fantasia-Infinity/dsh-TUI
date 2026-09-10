@@ -5,6 +5,7 @@ import type { WheelEvent } from '../ink/events/wheel-event.js'
 import { Divider } from '../components/design-system/Divider.js'
 import { HintLine } from '../components/design-system/HintLine.js'
 import { SearchBox } from '../components/SearchBox.js'
+import { PageInsetContext } from '../components/PageMargin.js'
 import { SessionListRow } from '../components/sessions/SessionListRow.js'
 import { SessionPreview } from '../components/sessions/SessionPreview.js'
 import { WorkspaceListRow } from '../components/sessions/WorkspaceListRow.js'
@@ -12,7 +13,7 @@ import { useTerminalFocus } from '../ink/hooks/use-terminal-focus.js'
 import { isMod, isPlainReturn, modLabel } from '../utils/modifiers.js'
 import { formatProject, projectName, spreadRow, tailWidth, truncateWidth } from '../sessions/format.js'
 import { stringWidth } from '../ink/stringWidth.js'
-import { TICK, MULTIPLICATION_X } from '../cc/figures.js'
+import { TICK, MULTIPLICATION_X } from '../terminal-utils/figures.js'
 import {
   anchorTop,
   buildView,
@@ -28,7 +29,7 @@ import {
 } from '../sessions/view.js'
 import { t, type I18nKey } from '../i18n.js'
 import { readSessionPins, setSessionPinned } from '../sessionPins.js'
-import type { Channel } from '../dsh-adapter/channel.js'
+import type { ChannelUi as Channel } from '../adapter/channel/ui-policy.js'
 import type { PreviewEntry, SessionSummary } from '../dsh-adapter/sessions/index.js'
 
 /** What the browser is doing with the focused row. */
@@ -152,6 +153,7 @@ export function SessionBrowser({
   onClose: () => void
 }): React.ReactNode {
   const { columns, rows } = useTerminalSize()
+  const inset = React.useContext(PageInsetContext)
   const isTerminalFocused = useTerminalFocus()
 
   const [sessions, setSessions] = React.useState<readonly SessionSummary[]>([])
@@ -1117,7 +1119,7 @@ export function SessionBrowser({
       )}
 
       {rules.has(2) && (<Box flexShrink={0}>
-        <Divider width={columns} />
+        <Divider bleed />
       </Box>)}
       <Box flexShrink={0}>
         <Text dimColor italic>
@@ -1128,12 +1130,14 @@ export function SessionBrowser({
       {/* Right-click session menu: a floating popup anchored one cell past
           the pointer, clamped so it never clips off the terminal. Its own
           clicks hit-test first (absolute hit list), and the root Box's
-          onClick dismisses it on any outside click. */}
+          onClick dismisses it on any outside click. 指针坐标是屏幕坐标，
+          而 absolute 盒相对内容区原点——有 PageMargin 页边距时需补回
+          inset（同 TooltipLayer 的补偿规则）。 */}
       {menu !== undefined && menuTarget !== undefined && (
         <Box
           position="absolute"
-          left={Math.max(0, Math.min(menu.col + 1, columns - MENU_WIDTH))}
-          top={Math.max(0, Math.min(menu.row + 1, rows - MENU_HEIGHT))}
+          left={Math.max(inset.x, Math.min(menu.col + 1, inset.x + Math.max(0, columns - MENU_WIDTH)))}
+          top={Math.max(inset.y, Math.min(menu.row + 1, inset.y + Math.max(0, rows - MENU_HEIGHT)))}
           width={MENU_WIDTH}
           height={MENU_HEIGHT}
           flexDirection="column"

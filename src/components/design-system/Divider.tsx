@@ -1,10 +1,11 @@
 import React, { useLayoutEffect, useRef, useState } from 'react'
 import Box from '../../ink/components/Box.js'
-import Text from '../../ink/components/Text.js'
+import Text from './ThemedText.js'
 import type { DOMElement } from '../../ink/dom.js'
 import measureElement from '../../ink/measure-element.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import { useTerminalSize } from '../../ink/hooks/use-terminal-size.js'
+import { usePageInset } from '../PageMargin.js'
 import type { Theme } from '../../theme.js'
 
 type DividerProps = {
@@ -37,6 +38,15 @@ type DividerProps = {
    * May contain ANSI codes (e.g., chalk-styled text).
    */
   title?: string
+
+  /**
+   * Full-bleed: extend the rule into the page margins to the terminal
+   * edges (page-level structural hairline — the page-margin convention:
+   * TEXT stays inside the content column, structural lines bleed). Use for
+   * screen-level dividers only; dividers inside cards, panels, or the
+   * transcript stay at content width. No-op outside PageMargin.
+   */
+  bleed?: boolean
 }
 
 // Upper bound on distinct measurements applied per terminal-width
@@ -48,7 +58,7 @@ const MAX_APPLIED_MEASUREMENTS = 8
 
 /**
  * A horizontal divider line, optionally with a title in the middle
- * (in the Claude Code visual language).
+ * in the dsh-TUI visual language.
  *
  * The rule fills the width Yoga actually grants it: the Box is measured
  * after layout (SearchBox pattern — a resize re-layouts without any prop
@@ -73,8 +83,16 @@ export function Divider({
   char = '─',
   padding = 0,
   title,
+  bleed = false,
 }: DividerProps): React.ReactNode {
   const { columns } = useTerminalSize()
+  const inset = usePageInset()
+  // Full-bleed: the rule spans the terminal columns, shifted left by the
+  // page inset via a negative margin (the box reaches into the margin
+  // area; the parent does not clip). `columns` here is the CONTENT width
+  // (PageMargin narrows TerminalSizeContext), so +2·inset.x = terminal.
+  const bleedX = bleed ? inset.x : 0
+  const bleedWidth = columns + 2 * bleedX
   const [measuredWidth, setMeasuredWidth] = useState<number | null>(null)
   const boxRef = useRef<DOMElement | null>(null)
   // Measurement feedback guard: the rule width rendered from
@@ -114,8 +132,9 @@ export function Divider({
     applied.push(w)
     setMeasuredWidth(w)
   })
-  const available = measuredWidth ?? columns
-  const lineWidth = Math.max(0, Math.min(available, width ?? columns) - padding)
+  const available = measuredWidth ?? bleedWidth
+  const target = bleed ? bleedWidth : (width ?? columns)
+  const lineWidth = Math.max(0, Math.min(available, target) - padding)
   const titleWidth = title ? stringWidth(title) : 0
 
   let text: string
@@ -136,7 +155,14 @@ export function Divider({
   }
 
   return (
-    <Box ref={boxRef}>
+    <Box
+      ref={boxRef}
+      {...(bleed
+        ? { width: bleedWidth, marginLeft: -bleedX }
+        : width !== undefined
+          ? { width }
+          : {})}
+    >
       <Text dimColor={!color} color={color} wrap="truncate-end">
         {text}
       </Text>

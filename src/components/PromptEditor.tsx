@@ -1,5 +1,6 @@
 import React from 'react'
-import { Box, Text } from '../ui.js'
+import { Box, Text, useTerminalSize } from '../ui.js'
+import { usePageInset } from './PageMargin.js'
 import type { Color } from '../ink/styles.js'
 import type { Theme } from '../theme.js'
 
@@ -41,6 +42,15 @@ function snapshot(): EditorNode {
   return editorNode
 }
 
+function openSnapshot(): boolean {
+  return editorNode !== null
+}
+
+/** Whether the fullscreen draft editor is currently published (open). */
+export function usePromptEditorOpen(): boolean {
+  return React.useSyncExternalStore(subscribe, openSnapshot)
+}
+
 /**
  * The fullscreen sink, mounted once at the very end of Chat's root Box.
  * The absolute cover is `opaque` so its padding/blank cells never bleed
@@ -49,17 +59,25 @@ function snapshot(): EditorNode {
  */
 export function PromptEditorLayer(): React.ReactNode {
   const node = React.useSyncExternalStore(subscribe, snapshot)
+  // Full-bleed cover: under PageMargin the Chat root box starts at the
+  // content origin, so the editor must extend into the page margins up to
+  // the terminal edges — the editor is a whole-screen surface, and the
+  // margin strips must be covered rather than letting the transcript
+  // bleed through.
+  const inset = usePageInset()
+  const size = useTerminalSize()
   if (node === null) return null
   return (
     <Box
       position="absolute"
-      top={0}
-      left={0}
-      width="100%"
-      height="100%"
+      top={-inset.y}
+      left={-inset.x}
+      width={size.columns + 2 * inset.x}
+      height={size.rows + 2 * inset.y}
       flexDirection="column"
       flexShrink={0}
       overflow="hidden"
+      backgroundColor="inputBackground"
       opaque
       onClick={(event) => {
         event.stopImmediatePropagation()
@@ -102,7 +120,7 @@ export function EditorButton({
         primary
           ? hovered
             ? 'userMessageBackgroundHover'
-            : (accent ?? 'claude')
+            : (accent ?? 'accent')
           : hovered
             ? 'userMessageBackgroundHover'
             : undefined

@@ -1,7 +1,7 @@
 import React from 'react'
 import { Box, Text, useTerminalSize, useTheme } from '../ui.js'
 import type { Color } from '../ink/styles.js'
-import { formatTokens } from '../cc/format.js'
+import { formatTokens } from '../terminal-utils/format.js'
 import { t } from '../i18n.js'
 import { formatContextUsage, DEFAULT_STATUS_BAR, normalizeStatusBar, type StatusBarConfig } from '../tuiDisplayPrefs.js'
 import { estimateSessionCostCny, estimateSessionCostSplitCny, isDeepSeekOfficialProvider, isPeakHour } from '../deepseekPricing.js'
@@ -12,7 +12,7 @@ import { formatJobDuration, type BackgroundJobState } from '../dsh-adapter/jobs.
 /** Stable fallback for stubbed channels: verify/repro harnesses render the
  *  real Chat with partial channel literals that predate the jobs field. */
 const NO_BACKGROUND_JOBS: readonly BackgroundJobState[] = []
-import type { Channel } from '../dsh-adapter/channel.js'
+import type { ChannelUi as Channel } from '../adapter/channel/ui-policy.js'
 import { modeDisplayName } from '../sessionModes.js'
 import { MiniWake } from '../components/trajectory/MiniWake.js'
 import { ContextBarView } from '../components/ContextBarView.js'
@@ -30,13 +30,13 @@ import {
 import type { WaveBand } from '../dsh-adapter/types.js'
 
 /**
- * The footer under the prompt input, in Claude Code's PromptInputFooter
- * layout: the segmented context progress bar on its own first line, the
+ * The footer under the prompt input: the segmented context progress bar on
+ * its own first line, the
  * status line below (left group: model · tokens · think level · cache · tps
  * gauge/sparkline; right group: git · cwd · title · short session id,
  * right-aligned), and the
  * mode/hint line last. The right side of the footer shows the latest
- * transient notification (errors in red, warnings in amber — CC style).
+ * transient notification (errors in red, warnings in amber).
  *
  * Every metric field is hover-aware (fullscreen mouse): dwelling on a field
  * swaps the ctx readout for a mini pressure gauge and parks that field's
@@ -44,6 +44,31 @@ import type { WaveBand } from '../dsh-adapter/types.js'
  * the footer stays one line tall, the detail is a peek, not a layout
  * change. Hovering a context-bar segment does the same for that segment.
  */
+
+/**
+ * Minimal mode's footer config. It ignores every SAVED preference (built from
+ * scratch rather than `normalizeStatusBar(channel.statusBar)`) and pins the
+ * DECORATION switches OFF — the shared defaults are free to change
+ * (`contextBar` became default-on in 2026-09) and minimal mode must not follow
+ * them into the footer.
+ *
+ * The metric fields keep their `DEFAULT_STATUS_BAR` values on purpose: minimal
+ * mode has ALWAYS shown the default-on metrics (thinking / contextUsage /
+ * cache / cost / goal) next to model + cwd — that predates the long-line fold
+ * and the context-bar flip, and trimming them further is a product decision,
+ * not a regression fix. Module scope: one frozen object, no per-render
+ * allocation.
+ */
+const MINIMAL_STATUS_BAR: StatusBarConfig = Object.freeze({
+  ...DEFAULT_STATUS_BAR,
+  compact: true,
+  model: true,
+  cwd: true,
+  contextBar: false,
+  activity: false,
+  trajectory: false,
+  shortcutHint: false,
+})
 
 /** Footer fields that answer a hover with a supplemental-row detail.
  *  Context-bar segments arrive as `segment:<key>` (see ContextBarView). */
@@ -55,6 +80,8 @@ type HoverTarget =
   | 'cost'
   | 'goal'
   | 'jobs'
+  | 'model'
+  | 'git'
   | 'sessionId'
   | 'cwd'
   | 'title'
@@ -149,7 +176,7 @@ export function StatusLine({
   const statusBar: StatusBarConfig = channel.minimal
     // Minimal mode overrides every field switch: model + cwd only, so the
     // footer can never grow decorations regardless of saved preferences.
-    ? { ...DEFAULT_STATUS_BAR, compact: true, model: true, cwd: true }
+    ? MINIMAL_STATUS_BAR
     : normalizeStatusBar(channel.statusBar)
   // Provider workspaces expose a remote display path alongside a host alias;
   // only the local target has identical cwd/displayCwd values to fold.
@@ -301,7 +328,7 @@ export function StatusLine({
 
   const leftFields: FieldPart[] = [
     ...(statusBar.model
-      ? [{ key: 'model', node: <Text color="inactiveShimmer">{channel.model}</Text> }]
+      ? [{ key: 'model', id: 'model' as const, node: <Text color="inactiveShimmer">{channel.model}</Text> }]
       : []),
     ...(tpsPart !== undefined ? [tpsPart] : []),
     ...(jobsPart !== undefined ? [jobsPart] : []),
@@ -352,6 +379,7 @@ export function StatusLine({
       ? [
           {
             key: 'git',
+            id: 'git' as const,
             node: <Text color="professionalBlue">{channel.gitBranch}</Text>,
           },
         ]
@@ -667,6 +695,24 @@ function buildHoverDetail(
           {dim('jobs ')}
           {shown.map(job => `${job.id} ${job.label} (${formatJobDuration(job)})`).join(' · ')}
           {rest > 0 ? ` · +${rest}` : ''}
+        </Text>
+      )
+    }
+    case 'model': {
+      return (
+        <Text wrap="truncate">
+          {dim('model ')}{channel.model} · {dim('provider ')}{channel.provider}
+          {channel.contextWindow !== undefined
+            ? <> · {dim('ctx ')}{formatTokens(channel.contextWindow)}</>
+            : null}
+        </Text>
+      )
+    }
+    case 'git': {
+      if (channel.gitBranch === undefined) return null
+      return (
+        <Text wrap="truncate">
+          {dim('git ')}{channel.gitBranch}
         </Text>
       )
     }
