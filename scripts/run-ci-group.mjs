@@ -458,6 +458,12 @@ const GROUPS = {
 // installModelSelection、#34 的投递异步化都没被它们拦下），挂进来
 // 防再腐烂。
     ["verify-submit", ['node', '--import', 'tsx/esm', 'scripts/verify-submit.mjs']],
+    ['verify-shell-compat', ['node', 'scripts/verify-shell-compat.mjs']],
+    ['verify-agent-lifecycle-compat', ['node', 'scripts/verify-agent-lifecycle-compat.mjs']],
+    ['verify-bundled-presets', ['node', 'scripts/verify-bundled-presets.mjs']],
+    ['verify-preset-startup', ['node', 'scripts/verify-preset-startup.mjs']],
+    ['verify-message-compat', ['node', 'scripts/verify-message-compat.mjs']],
+    ['verify-settings-compat', ['node', '--import', 'tsx/esm', 'scripts/verify-settings-compat.mjs']],
     ["verify-compact", ['node', '--import', 'tsx/esm', 'scripts/verify-compact.mjs']],
     ["verify-context-warning", ['node', '--import', 'tsx/esm', 'scripts/verify-context-warning.mjs']],
     ["verify-channel-goal-todo", ['node', '--import', 'tsx/esm', 'scripts/verify-channel-goal-todo.mjs']],
@@ -481,9 +487,9 @@ const GROUPS = {
 // 切换重置、/clear 后在途子代理卡可回现、staged image token 会话作用域
 // （switchModel 不泄漏）、resumeTo 竞争切换守卫、recap 预算从新到旧收容。
     ["verify-session-reset-hygiene", ['node', '--import', 'tsx/esm', 'scripts/verify-session-reset-hygiene.tsx']],
-// Agent View 回归：派生辅助（折叠/摘要/状态映射/标题回退）、无头整屏
-// 组装、按键驱动（派发/预览/帮助/退出）、停止→删除武装的安全语义
-// （Enter 取消、焦点漂移不得改向、窗口过期自动解除）。
+// 会话总览投影回归：派生辅助（折叠/摘要/状态映射/标题回退）+ Chat 接线
+// （「← N 个会话等待输入」页脚与空输入按 ← 请求后台化）。整屏 Agent View
+// 已随三合一会话界面删除，其断言一并移除。
     ["verify-agent-view", ['node', '--import', 'tsx/esm', 'scripts/verify-agent-view.mjs']],
 // 后台任务（ctx.jobs）UI 投影：BackgroundJobStore 单元（注册/转换/消失
 // 合成 killed/输出镜像有界）、channel 集成（建卡、job_output 镜像、落定
