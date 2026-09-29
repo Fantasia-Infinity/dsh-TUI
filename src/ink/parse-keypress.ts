@@ -5,7 +5,7 @@
  * then interprets sequences as keypresses.
  */
 import { Buffer } from 'buffer'
-import { PASTE_END, PASTE_START } from './termio/csi.js'
+import { isCSIFinal, isCSIIntermediate, isCSIParam, PASTE_END, PASTE_START } from './termio/csi.js'
 import { createTokenizer, type Tokenizer } from './termio/tokenize.js'
 
 // eslint-disable-next-line no-control-regex
@@ -15,6 +15,12 @@ const META_KEY_CODE_RE = /^(?:\x1b)([a-zA-Z0-9])$/
 const FN_KEY_RE =
   // eslint-disable-next-line no-control-regex
   /^(?:\x1b+)(O|N|\[|\[\[)(?:(\d+)(?:;(\d+))?([~^$])|(?:1;)?(\d+)?([a-zA-Z]))/
+
+// Complete CSI framing, including sequences outside our keyboard vocabulary.
+// Keep their identity so InputEvent's unknown-code guard suppresses protocol
+// bytes rather than stripping ESC and inserting the parameters as text.
+// eslint-disable-next-line no-control-regex
+const COMPLETE_CSI_RE = /^\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]$/
 
 // CSI u (kitty keyboard protocol): ESC [ codepoint [; modifier] u
 // Example: ESC[13;2u = Shift+Enter, ESC[27u = Escape (no modifiers)
@@ -49,6 +55,12 @@ const MODIFY_OTHER_KEYS_RE = /^\x1b\[27;(\d+);(\d+)~/
 const WIN32_INPUT_RE = /^\x1b\[([\d;]*)_$/
 const WIN32_INPUT_TAIL_RE = /\[\d*;\d*;\d*;[01](?:;\d*){0,2}_/g
 const WIN32_INPUT_TAILS_RE = /^(?:\[\d*;\d*;\d*;[01](?:;\d*){0,2}_)+$/
+const WIN32_INPUT_PREFIX_RE = /^\x1b\[[\d;]*$/
+const WIN32_INPUT_BODY_PREFIX_RE = /^\x1b\[\d*;\d*;\d*;[01]?(?:;\d*){0,2}$/
+// A record fits well within 64 bytes (six INPUT_RECORD integer fields).
+// Bound both memory and the time ambiguous digits can be held after ESC.
+const WIN32_INPUT_MAX_LENGTH = 64
+const WIN32_INPUT_GRACE_MS = 1000
 
 // Prefix of a fragmenting SGR mouse report (`[<btn;col;rowM/m`). ConPTY can
 // split one report across multiple stdin reads; when App's 50ms escape timer
@@ -579,6 +591,13 @@ export type Win32PasteState = {
   held: ParsedKey[]
   /** collected paste content while active */
   buffer: string
+  /**
+   * True when the last character appended to `buffer` came from a CR record
+   * (Uc=13). Classic conhost spells a pasted CRLF break as a CR record
+   * followed by an LF record (Uc=10); the LF half must fold into the CR's
+   * newline instead of appending a second one (issue #1090).
+   */
+  lastWasCarriageReturn: boolean
 }
 
 // Character spellings of CSI 200~ / CSI 201~ as key records: the ESC char
@@ -613,6 +632,42 @@ function win32RecordChar(key: ParsedKey): string | undefined {
 }
 
 /**
+ * Uc field of the raw win32 record behind `key`, or undefined when the key
+ * did not come from one (the decomposed stream also carries plain keys).
+ */
+function win32RecordUc(key: ParsedKey): number | undefined {
+  const match = WIN32_INPUT_RE.exec(key.raw ?? '')
+  if (!match) return undefined
+  const field = match[1]!.split(';')[2]
+  return field === undefined || field === '' ? 0 : parseInt(field, 10)
+}
+
+/**
+ * Append one paste-body key to the decomposed-paste buffer. Classic conhost
+ * spells a pasted CRLF break as two records — CR (Uc=13) then LF (Uc=10) —
+ * and the LF must fold into the CR's newline instead of appending a second
+ * one (issue #1090). Only a CR record arms the fold, so LF-only text, a lone
+ * CR, and ordinary characters (including a real `_`) keep their bytes.
+ */
+function appendWin32PasteChar(state: Win32PasteState, key: ParsedKey): void {
+  const ch = win32RecordChar(key)
+  if (ch === undefined) return
+  if (ch !== '\n') {
+    state.lastWasCarriageReturn = false
+    state.buffer += ch
+    return
+  }
+  const uc = win32RecordUc(key)
+  if (uc === 10 && state.lastWasCarriageReturn) {
+    // LF record closing the CRLF pair: the CR already emitted the newline.
+    state.lastWasCarriageReturn = false
+    return
+  }
+  state.lastWasCarriageReturn = uc === 13
+  state.buffer += '\n'
+}
+
+/**
  * Feed one translated win32 key through the decomposed-paste matcher.
  * Returns the keys to emit (empty while holding a candidate prefix or
  * collecting paste content).
@@ -633,12 +688,14 @@ function feedWin32Paste(state: Win32PasteState, key: ParsedKey): ParsedKey[] {
       if (!state.active) {
         state.active = true
         state.buffer = ''
+        state.lastWasCarriageReturn = false
         return []
       }
       // End marker complete: the whole paste as a single event.
       const paste = createPasteKey(state.buffer)
       state.active = false
       state.buffer = ''
+      state.lastWasCarriageReturn = false
       return [paste]
     }
     return []
@@ -652,14 +709,14 @@ function feedWin32Paste(state: Win32PasteState, key: ParsedKey): ParsedKey[] {
     state.held = []
     state.matched = 0
     if (state.active) {
-      for (const k of held) state.buffer += win32RecordChar(k) ?? ''
+      for (const k of held) appendWin32PasteChar(state, k)
       return feedWin32Paste(state, key)
     }
     return [...held, ...feedWin32Paste(state, key)]
   }
 
   if (state.active) {
-    state.buffer += win32RecordChar(key) ?? ''
+    appendWin32PasteChar(state, key)
     return []
   }
   return [key]
@@ -779,6 +836,23 @@ export type KeyParseState = {
   incomplete: string
   pasteBuffer: string
   /**
+   * Host-injected platform gate: this machine MIGHT run the private win32
+   * input mode (`supportsWin32InputMode()`). Read-only — capability alone is
+   * not evidence and never lights anything by itself; only an explicit
+   * `false` closes the gate, and leaving the field absent keeps the parser's
+   * pre-gate behavior for direct callers.
+   */
+  win32Capable?: boolean
+  /**
+   * Lit by successfully decoding a win32 record. Only behind that evidence
+   * may a plain `ESC[` fragment extend the hold (see isRecordPrefix).
+   */
+  win32InputMode?: boolean
+  /** First capture of a buffered win32 record; never renewed by flushes. */
+  win32InputStartedAt?: number
+  /** A flushed lone ESC may be followed by an ESC-less record fragment. */
+  win32EscFlushedAt?: number
+  /**
    * Pending high surrogate from a win32-input-mode record. Uc is a UTF-16
    * code unit, so supplementary-plane characters (emoji, CJK ext-B) arrive
    * as two consecutive records; the high half waits here for its low half.
@@ -857,7 +931,8 @@ function inputToString(input: Buffer | string): string {
  * Tokenize and parse a chunk of terminal input into parsed keys, mouse
  * events, and terminal responses, maintaining paste-mode state.
  * @param prevState - the state returned by the previous call, or INITIAL_STATE.
- * @param input - the input chunk; null flushes the tokenizer's pending input.
+ * @param input - the input chunk; null applies the escape timeout (in-flight
+ * win32 records keep their bounded recovery grace).
  * @returns the parsed inputs plus the state to pass to the next call.
  */
 export function parseMultipleKeypresses(
@@ -865,7 +940,7 @@ export function parseMultipleKeypresses(
   input: Buffer | string | null = '',
 ): [ParsedInput[], KeyParseState] {
   const isFlush = input === null
-  const inputString = isFlush ? '' : inputToString(input)
+  let inputString = isFlush ? '' : inputToString(input)
 
   // Get or create tokenizer
   const tokenizer = prevState._tokenizer ?? createTokenizer({
@@ -873,15 +948,81 @@ export function parseMultipleKeypresses(
     splitInputControls: true,
   })
 
-  // Tokenize the input
-  const tokens = isFlush ? tokenizer.flush() : tokenizer.feed(inputString)
+  // Keep record framing in the tokenizer, rather than converting a timed-out
+  // prefix into a key and trying to scrub its text later (#827). The host
+  // capability flag only says the platform MIGHT run the private mode; only a
+  // decoded record proves it does, so the two stay separate: a frame whose
+  // own shape is already record-specific holds on its own (that is how even
+  // the first record survives a split), and anything else needs an open gate
+  // plus a lit parser. A lone ESC therefore keeps its 50ms behavior on hosts
+  // that ignore DECSET 9001, and bracketed-paste payloads remain literal.
+  let win32InputMode = prevState.win32InputMode ?? false
+  let win32InputStartedAt = prevState.win32InputStartedAt
+  let win32EscFlushedAt = prevState.win32EscFlushedAt
+  let inPaste = prevState.mode === 'IN_PASTE'
+  const now = Date.now()
+  // Gate × evidence. The nullish default keeps direct callers that never
+  // inject the flag on the pre-gate behavior.
+  const win32HoldAllowed = (prevState.win32Capable ?? true) && win32InputMode
+  const isRecordPrefix = (value: string): boolean =>
+    !inPaste && WIN32_INPUT_PREFIX_RE.test(value) &&
+    (WIN32_INPUT_BODY_PREFIX_RE.test(value) || win32HoldAllowed)
+
+  if (win32InputStartedAt !== undefined && now - win32InputStartedAt >= WIN32_INPUT_GRACE_MS) {
+    tokenizer.reset()
+    win32InputStartedAt = undefined
+  }
+  if (win32EscFlushedAt !== undefined && now - win32EscFlushedAt >= WIN32_INPUT_GRACE_MS) {
+    win32EscFlushedAt = undefined
+  }
+  if (inputString && win32EscFlushedAt !== undefined) {
+    // Only the immediate continuation of an actual ESC flush may acquire
+    // a missing introducer. Never capture arbitrary '['-led user text.
+    if (
+      prevState.mode !== 'IN_PASTE' && tokenizer.buffer() === '' &&
+      /^\[(?:[\d;]|$)/.test(inputString) &&
+      (WIN32_INPUT_BODY_PREFIX_RE.test('\x1b' + inputString) || win32HoldAllowed)
+    ) inputString = '\x1b' + inputString
+    win32EscFlushedAt = undefined
+  }
+
+  const pending = tokenizer.buffer()
+  if (isRecordPrefix(pending) && inputString) {
+    const continuation = /^[\d;]*/.exec(inputString)![0]
+    const final = inputString[continuation.length]
+    const code = final?.charCodeAt(0)
+    // A numeric prefix is not proof of Win32 framing: even four or more
+    // parameters can belong to another CSI. Let the tokenizer consume valid
+    // parameter/intermediate/final bytes; only an invalid continuation can
+    // abandon the old frame. A bare ASCII letter may therefore end the CSI,
+    // not start user text. Native Win32 typing supplies a fresh ESC record.
+    if (
+      code !== undefined &&
+      !isCSIParam(code) && !isCSIIntermediate(code) && !isCSIFinal(code)
+    ) {
+      tokenizer.reset()
+      win32InputStartedAt = undefined
+      if (final === '\x1b') inputString = inputString.slice(continuation.length)
+    }
+  }
+
+  let deferFlush = isFlush && isRecordPrefix(tokenizer.buffer())
+  if (deferFlush && tokenizer.buffer().length > WIN32_INPUT_MAX_LENGTH) {
+    tokenizer.reset()
+    deferFlush = false
+  }
+  const tokens = isFlush
+    ? deferFlush ? [] : tokenizer.flush()
+    : tokenizer.feed(inputString)
+  if (isFlush && !inPaste && tokens.some(token => token.value === '\x1b')) {
+    win32EscFlushedAt = now
+  }
 
   // Convert tokens to parsed keys, handling paste mode
   const keys: ParsedInput[] = []
-  let inPaste = prevState.mode === 'IN_PASTE'
   let pasteBuffer = prevState.pasteBuffer
   // Surrogate-pair scratch for win32-input-mode records. Threaded through a
-  // local object so prevState is never mutated — App.tsx seeds the parser
+  // local object so prevState is never mutated — callers can seed the parser
   // with the shared INITIAL_STATE singleton, and a pending high surrogate
   // leaking into it would survive into fresh parser instances.
   const win32Ctx: { high?: number; altHigh?: number } = {
@@ -896,6 +1037,7 @@ export function parseMultipleKeypresses(
     matched: 0,
     held: [],
     buffer: '',
+    lastWasCarriageReturn: false,
   }
   const win32Protocol: Win32ProtocolState = prevState.win32Protocol ?? {
     held: [],
@@ -961,6 +1103,7 @@ export function parseMultipleKeypresses(
       } else {
         const win32 = parseWin32KeyEvent(token.value, win32Ctx)
         if (win32 !== undefined) {
+          win32InputMode = true
           // A fresh protocol record proves a held SGR prefix's report died:
           // report bytes are contiguous on the wire, so nothing may
           // interleave between a report's fragments.
@@ -1034,6 +1177,7 @@ export function parseMultipleKeypresses(
         // record tails so their protocol bytes do not leak into the prompt.
         for (const tail of token.value.match(WIN32_INPUT_TAIL_RE) ?? []) {
           const win32 = parseWin32KeyEvent('\x1b' + tail, win32Ctx)
+          if (win32 !== undefined) win32InputMode = true
           if (win32 !== undefined && win32 !== null) {
             for (let i = 0; i < win32.repeat; i++) {
               keys.push(...feedWin32Input(win32Paste, win32Protocol, win32.key))
@@ -1121,6 +1265,21 @@ export function parseMultipleKeypresses(
     }
   }
 
+  // Inspect the trailing buffer AFTER processing tokens: this read may have
+  // entered a literal paste, or decoded the first win32 record. Emitting a
+  // token ended the old sequence, so a new prefix gets its own deadline.
+  if (tokens.length > 0) win32InputStartedAt = undefined
+  if (isRecordPrefix(tokenizer.buffer())) {
+    if (tokenizer.buffer().length > WIN32_INPUT_MAX_LENGTH) {
+      tokenizer.reset()
+      win32InputStartedAt = undefined
+    } else {
+      win32InputStartedAt ??= now
+    }
+  } else {
+    win32InputStartedAt = undefined
+  }
+
   // If flushing and still in paste mode, emit what we have
   if (isFlush && inPaste && pasteBuffer) {
     keys.push(createPasteKey(pasteBuffer))
@@ -1129,11 +1288,12 @@ export function parseMultipleKeypresses(
   }
 
   // Flush handling for the decomposed win32 paste: mid-paste (active) the
-  // 50ms quiet timer means the paste stream ended — finalize with whatever
+  // quiet timeout means the paste stream ended — finalize with whatever
   // was collected (mirrors the VT IN_PASTE flush above; a truncated end
   // marker must not strand the matcher and eat all future typing). Outside
   // a paste, release any held marker-prefix keys (e.g. a lone Escape).
-  if (isFlush && win32Paste.active) {
+  // A deferred record flush must not split these higher-level matchers.
+  if (isFlush && !deferFlush && win32Paste.active) {
     let content = win32Paste.buffer
     for (const k of win32Paste.held) content += win32RecordChar(k) ?? ''
     keys.push(createPasteKey(content))
@@ -1141,16 +1301,18 @@ export function parseMultipleKeypresses(
     win32Paste.buffer = ''
     win32Paste.held = []
     win32Paste.matched = 0
-  } else if (isFlush && win32Paste.held.length > 0) {
+    win32Paste.lastWasCarriageReturn = false
+  } else if (isFlush && !deferFlush && win32Paste.held.length > 0) {
     keys.push(...win32Paste.held)
     win32Paste.held = []
     win32Paste.matched = 0
+    win32Paste.lastWasCarriageReturn = false
   }
 
   // A quiet timeout ends a synthesized protocol candidate. Incomplete mouse
   // reports are terminal input and must not become prompt text; other held
   // input (a lone Escape or an unknown CSI sequence) remains ordinary keys.
-  if (isFlush && win32Protocol.held.length > 0) {
+  if (isFlush && !deferFlush && win32Protocol.held.length > 0) {
     const isMouseCandidate =
       win32Protocol.sequence.startsWith('\x1b[<') ||
       win32Protocol.sequence.startsWith('\x1b[M')
@@ -1185,6 +1347,12 @@ export function parseMultipleKeypresses(
         ? '\x1b'
         : ''),
     pasteBuffer,
+    // The host gate rides along: App replaces its state with this object on
+    // every read, and the hold must stay closed for the whole session.
+    win32Capable: prevState.win32Capable,
+    win32InputMode,
+    win32InputStartedAt,
+    win32EscFlushedAt,
     win32HighSurrogate: win32Ctx.high,
     win32AltHighSurrogate: win32Ctx.altHigh,
     win32Paste,
@@ -1754,6 +1922,10 @@ function parseKeypress(s: string = ''): ParsedKey {
       return createNavKey(s, 'left', true)
     case '\u001b[1;5C':
       return createNavKey(s, 'right', true)
+  }
+
+  if (!key.name && !key.code && COMPLETE_CSI_RE.test(s)) {
+    key.code = s.slice(1)
   }
 
   return key

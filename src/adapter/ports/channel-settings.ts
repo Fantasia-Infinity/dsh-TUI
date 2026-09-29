@@ -100,6 +100,9 @@ export interface ConfiguredProvider {
   /** Explicit `api` override in the stored profile; catalog routes can
    *  carry one too, so this alone does not classify the route. */
   readonly api?: string
+  /** Effective profile needs custom request headers that the anonymous
+   *  discovery request cannot inherit from the named route. */
+  readonly hasCustomHeaders?: boolean
   /** Enabled model ids; undefined means the whole catalog stays served. */
   readonly models?: readonly string[]
   /**
@@ -204,6 +207,15 @@ export interface TuiSettingsGroup {
   title: string
   /** Provider-owned translations for the title. */
   descriptions?: LocalizedDescriptions
+  /**
+   * Root-page presentation. 'page' (the default) renders one navigation
+   * row that opens the group's fields on a subpage — for deep, cohesive
+   * domains. 'inline' renders the fields directly on the root page under
+   * a small header — for shallow topics where a subpage round-trip costs
+   * more clicks than the ordering buys. Subpage navigation (Esc back,
+   * focus reset) only exists for 'page' groups.
+   */
+  mode?: 'inline' | 'page'
 }
 
 export interface TuiSettingsField {

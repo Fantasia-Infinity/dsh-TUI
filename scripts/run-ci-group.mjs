@@ -32,7 +32,8 @@
  *     CI 那一次失败的原始帧字节才是证据。
  */
 import { spawnSync } from 'node:child_process'
-import { appendFileSync, mkdirSync, rmSync, statSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const env = { NODE_ENV: 'production', ...process.env }
@@ -89,6 +90,10 @@ const GROUPS = {
 // 卡片边框行——下滚到底丢 ╰──╯、上滚到顶丢 ╭─ 标题；窗口必须贴住列表
 // 物理边界（根页/group 子页/极小视口下焦点永不被钉边挤出）。
     ["verify-settings-scroll", ['node', '--import', 'tsx/esm', 'scripts/verify-settings-scroll.tsx']],
+// /settings 根页分组呈现回归：inline 组字段平铺根页（标题行不可聚焦，
+// 焦点序跳过标题直达字段），page 组与无 mode 的旧默认仍走子页；空的
+// inline 组不渲染孤儿标题。
+    ["verify-settings-root-inline", ['node', '--import', 'tsx/esm', 'scripts/verify-settings-root-inline.tsx']],
     ["repro-inline-scrollback", ['node', '--import', 'tsx/esm', 'scripts/repro-inline-scrollback.tsx']],
     ["repro-inline-thirdparty", ['node', '--import', 'tsx/esm', 'scripts/repro-inline-thirdparty.tsx']],
 // 安全回归：OSC 出口控制字符剥离 + 超链接 scheme 门禁（安全审查
@@ -108,6 +113,28 @@ const GROUPS = {
 // 空转重渲染风暴回归（issue #433）：长历史 + 30ms 空转 commit 风暴下
 // renderScrollTop / 画面 / 输入框行数必须逐帧恒定，几何不震荡。
     ["repro-idle-oscillation", ['node', '--import', 'tsx/esm', 'scripts/repro-idle-oscillation.tsx']],
+// 静置空转的终端下泄回归：inline 模式下光标停在内容下一行时，用 LF 补行会
+// 逐行滚动终端——一帧「什么都没变」的画面也往回滚缓冲里塞一份重复视口
+// （实测 ~73 LF/s）。静置窗口内 stdout 不得出现 LF、回滚缓冲不得增长，同时
+// 鲸鱼闲置动画必须仍在重绘（不许靠冻结界面取巧）。
+    ["verify-idle-repaint", ['node', '--import', 'tsx/esm', 'scripts/verify-idle-repaint.tsx']],
+// 开屏头部契约：大字 5 行高且等宽（8×7 = 7×8）、bigTextWidth 与实际画出的列数
+// 一致；窄终端按「鲸鱼+大字 → 纯大字 → 纯鲸鱼 → 纯文字」逐档降级，档位无空档。
+    ["verify-splash-layout", ['node', '--import', 'tsx/esm', 'scripts/verify-splash-layout.ts']],
+// 开屏彩蛋契约：节日换词（每款字体都要有 HAPPINESS/MERRY/NEW YEAR 的全部字形，
+// 两行等宽 + 下排居中取最紧解）与 1/20 的求 star 标语（OSC 8 成对 + URL 正确、
+// 缩进按该行实际宽度重算、不支持超链接时退化成纯文本 URL），并挂真实 LogoV2 读屏。
+    ["verify-splash-eggs", ['node', '--import', 'tsx/esm', 'scripts/verify-splash-eggs.tsx']],
+    // 求 star 的触发条件（累计启动次数 / 累计在线时长的里程碑阶梯、账本坏文件兜底）：
+    ["verify-usage-stats", ['node', '--import', 'tsx/esm', 'scripts/verify-usage-stats.mjs']],
+    // 一键 star 的 gh 集成（探测/登录态/超时/失败分类，全用假执行器不联网）：
+    ["verify-star-action", ['node', '--import', 'tsx/esm', 'scripts/verify-star-action.mjs']],
+    // 女仆娘立绘（whaleGirl 设置 + 头部换画/阶梯契约）与 99h/999 次"求 star"
+    // 开屏弹窗（挂真实 Chat：弹一次/记账/Esc 关且关后不抢键/忙时不弹不记账）：
+    ["verify-whale-girl", ['node', '--import', 'tsx/esm', 'scripts/verify-whale-girl.tsx']],
+// 标题女仆娘立绘透明回归：假 Windows Terminal（DA1→Sixel）下立绘以
+// transparent 放置、无衬底色——只画她自己的像素，壁纸从周围透出来。
+    ["verify-maid-portrait-transparent", ['node', '--import', 'tsx/esm', 'scripts/verify-maid-portrait-transparent.tsx']],
 // settled 子代理卡片不得永久持有动画时钟（空闲帧归零回归）：
 // 曾以 120ms/卡片持续驱动 React commit，N 张相位错开合成 ~30ms
 // 均匀帧 cadence。
@@ -199,6 +226,11 @@ const GROUPS = {
 // Uc 优先、代理对与 keyup 交错、Rc 重复展开、conhost 拆散粘贴重组、
 // Alt+numpad 两轮合成。
     ["verify-win32-input", ['node', '--import', 'tsx/esm', 'scripts/verify-win32-input.tsx']],
+// 粘贴记录残留清洗回归（issue #1090）：win32 记录残留（带 ESC 的完整形态
+// 与记录拆散后无 ESC 的尾部形态）必须在入口整体剥离、不留下 `_`；真实
+// 下划线、仅形似的方括号文本、普通 bracketed paste 与既有 ANSI/CRLF
+// 归一化零误伤。
+    ["verify-paste-residue", ['node', '--import', 'tsx/esm', 'scripts/verify-paste-residue.tsx']],
 // win32 协议重组回归：conhost 把 SGR/X10 鼠标报告与终端回复（DA1 等）
 // 合成成逐字符 CSI Vk;Sc;Uc;Kd;Cs;Rc 记录时，必须跨块重组回完整协议
 // 事件而不是逐键泄漏进输入框；截断的鼠标候选在 flush 时丢弃，单独
@@ -279,14 +311,39 @@ const GROUPS = {
 // verify-composer-draft-handoff；在途 staging 围栏在 verify:build 链的
 // verify-image-preview。完整 8 场景矩阵见 PR #942 历史。
     ["verify-composer-draft-screen-switch", ['node', '--import', 'tsx/esm', 'scripts/verify-composer-draft-screen-switch.tsx']],
+// 队列召回撤回回归（issue #986 后半）：↑ 走位召回的文本若仍挂在 pending 里，
+// 必须把那条排队副本撤下来（否则改完重发等于同一句发两遍）——可撤时队列少一条
+// 且有提示、已被本轮取走时如实报「撤不回来」且副本留在队列、文本不匹配的排队
+// 项一律不动。
+    ["verify-prompt-history-queue-retract", ['node', 'scripts/verify-prompt-history-queue-retract.mjs']],
   ],
   'session-workspace': [
+// 跨代理会话迁移回归（claude-code/codex/omp/zcode/grok-build → DSH sessions）：
+// 全程跑官方读取链——Session.append 生成骨架（turn 配对/reasoning/
+// provenance/空 system head/工具调用/中断/标题/压缩检查点）、
+// JsonlSessionPersistence 落盘、open+fromRestore+deriveMessages 逐消息
+// 断言（CJK/emoji 无损、wire 合法）、restore 作 seed 续聊写回并替换 head、
+// uuid v5 幂等、五 adapter fixture 解析（含 sourceId 只取裸文件名）、
+// /migrate 命令分类矩阵。
+    ["verify-migrate", ['node', '--import', 'tsx/esm', 'scripts/verify-migrate.mjs']],
+// 迁移源解析层回归（纯函数、合成 fixture）：jsonl 坏行计数、注入识别与
+// 包装剥离、标题归一、工具调用配对，以及各源逐条解析规则。
+    ["verify-migrate-parse", ['node', '--import', 'tsx/esm', 'scripts/verify-migrate-parse.mjs']],
+// 外部来源浏览层回归（临时目录合成 fixture）：扫描 IO（头尾窗口、异步遍历、
+// 指纹复用）、各源 scan()/load()、来源探测、catalog 快照、单会话导入。
+    ["verify-migrate-browse", ['node', '--import', 'tsx/esm', 'scripts/verify-migrate-browse.mjs']],
+// /migrate 交互回归（挂真实 Chat）：fresh 会话直接 `/migrate <agent>` 必须
+// 打开确认层（旧实现查 picker 行缓存，缓存为空时一律报未知源）、未知源仍
+// 被拒、`--dry-run` 要源、多源报 usage、重开选择器清空上一轮勾选。
+    ["verify-migrate-command", ['node', '--import', 'tsx/esm', 'scripts/verify-migrate-command.tsx']],
 // 审批服务配置回归（issue #49 尾巴）：裸组合 cordis.yml 必须挂载
 // approval 行；裸组合与 profile patch 的 policy 表达式逐场景同值
 // （ask / never / win32 never），两个入口语义不漂移。
     ["verify-cordis-approval", ['node', 'scripts/verify-cordis-approval.mjs']],
-// 工作状态由基础事件在进程内派生：阶段、500ms tick、Agent 切换重置。
-    ["verify-working-activity", ['node', 'scripts/verify-working-activity.mjs']],
+// 工作状态现在由 dsh-working-activity 插件的 session projection 拥有：本 app 只读，
+// 不再在进程内折叠。这条静态门禁钉住「唯一 owner」——没有 tracker、没有 status
+// import、没有 sidecar、channel 层不转发活动信号也不持 tick。
+    ["verify-activity-ownership", ['node', '--import', 'tsx/esm', 'scripts/verify-activity-ownership.ts']],
 // TUI 创建及恢复的会话必须持久关联到 Workspace。
     ["verify-workspace-attachment", ['node', 'scripts/verify-workspace-attachment.mjs']],
 // tuiWorkspaces 服务可选化回归（issue #183）：代码层 inject 不含
@@ -312,6 +369,12 @@ const GROUPS = {
 // 会话标题回归：选择器标题宽容读取（带未标记第三方事件的日志
 // 不能让标题退化成目录名），/rename 的最后一条 session/title 优先。
     ["verify-session-titles", ['node', 'scripts/verify-session-titles.mjs']],
+// session/title 载荷形状回归（issue #1006）：真存储栈 e2e——离线写入器
+// （/fork + 选择器改名）与实时 /rename 共用的 userTitleData 必须带
+// messageSeqs/source，否则严格读取把整份日志判损坏（stored log is
+// corrupt: title messageSeqs requires an array）而会话再也 resume 不了；
+// 同一夹具塞旧形状 `{ title }` 必须仍被拒（红态自证，回退修复即失败）。
+    ["verify-session-title-payload", ['node', 'scripts/verify-session-title-payload.mjs']],
 // resume 遗留事件注册回归（issue #153）：真实存储栈 e2e——注册前
 // load() 抛 SessionFormatUnsupportedError（原样复现 issue）、注册后
 // 放行；日志字节与 0600 权限绝不被改写；非白名单未知类型保持拒读
@@ -358,6 +421,11 @@ const GROUPS = {
 // 输入历史草稿回归（issue #287）：首次 ↑ 保存未提交草稿，遍历历史后
 // ↓ 回到末尾必须恢复原文，重复越界不能把草稿清空。
     ["verify-prompt-history-draft", ['node', 'scripts/verify-prompt-history-draft.mjs']],
+// 输入历史持久化回归（issue #986）：↑/↓ 必须走磁盘上的 history.jsonl——
+// 冷启动后第一次 ↑ 召回的是最新一条（文件是追加序，漏了反转会翻出最旧的）、
+// 能一路走到最旧并在那里钳住、本次进程提交的条目排在持久化条目之后且
+// 接缝处不重复、重新挂载（重启）后仍能召回。
+    ["verify-prompt-history-persist", ['node', 'scripts/verify-prompt-history-persist.mjs']],
 // 文件补全回归（issue #278）：CMake 构建目录与任意大型兄弟目录不得
 // 独占 100 条全局预算，普通深层源码也不能被固定深度静默截断。
     ["verify-file-completion", ['node', 'scripts/verify-file-completion.mjs']],
@@ -381,6 +449,10 @@ const GROUPS = {
 // 日志、标题来源判定、revision 命中/失效（钉住 revision 改写日志作
 // 判据）、索引自愈与剪枝、**终态等价**（增量索引 == 全新构建）。
     ["verify-session-index", ['node', 'scripts/verify-session-index.mjs']],
+// 真 JSONL 混合版本库：无关追加不重读旧会话摘要，文件改写/替换仍须失效。
+    ["verify-session-artifact-cache", ['node', 'scripts/verify-session-artifact-cache.mjs']],
+// 跨进程首屏快照：不等慢枚举、来源隔离、失败保留、空库清空与迟到守卫。
+    ["verify-session-list-snapshot", ['node', 'scripts/verify-session-list-snapshot.mjs']],
 // 空会话须完整读取后才能判定：截断/损坏、帧数上限、纯图片输入与旧缓存
 // 不得隐藏真实历史或进入清理名单；真实 JSONL 重开验证落盘后的可见性。
     ['verify-session-emptiness', ['node', '--import', 'tsx/esm', 'scripts/verify-session-emptiness.ts']],
@@ -405,6 +477,11 @@ const GROUPS = {
 // （开始/结束时刻、耗时、运行中时长）；折叠的终端脚本与超出 480 字符预算
 // 的 args 仍弹完整内容（弹层优先真隐藏内容）。
     ["verify-tool-tooltip-gating", ['node', '--import', 'tsx/esm', 'scripts/verify-tool-tooltip-gating.tsx']],
+// 工具卡 i18n 回归（issue #980）：卡片簇（AssistantToolUseMessage /
+// SplitDiffView）的界面文案——工具名、按行折叠提示、退出码/信号行、
+// 运行中占位、搜索截断——必须在 zh/en 双语都走字典渲染；与 verify-i18n
+// 的字面量 tripwire 互补（那边管源码侧，这边管渲染侧）。
+    ["verify-toolcard-i18n", ['node', '--import', 'tsx/esm', 'scripts/verify-toolcard-i18n.tsx']],
 // 悬停浮层第二批回归：@ 文件补全面板长路径悬停弹全路径（完整可见的短路径
 // 不弹）、会话列表行标题截断悬停弹完整标题+绝对时间+cwd（未截断不重复
 // 标题）、状态栏 model/git 字段悬停明细（provider/ctx 窗口/完整分支）。
@@ -445,6 +522,12 @@ const GROUPS = {
   'channel-ui': [
 // L4 composition boundary plus report/metadata lifetime fences.
     ["verify-channel-composition", ['node', '--import', 'tsx/esm', 'scripts/verify-channel-composition.ts']],
+// 状态行的读侧：会话键控、变更通知、宿主发布值的防御性收窄、绑定时的基线读取
+// （投影只在变化时推送，恢复/重连的会话必须自己读一次当前值）。
+    ["verify-activity-store", ['node', '--import', 'tsx/esm', 'scripts/verify-activity-store.ts']],
+// 状态行的渲染面：投影值经 hook 到达屏幕、后台会话不得抢当前行、清空即消失、
+// 两个接缝同时有值时以投影为准（读侧迁移对显示是零变化）。
+    ["verify-activity-store-render", ['node', '--import', 'tsx/esm', 'scripts/verify-activity-store-render.tsx']],
     ["verify-channel-owner-lifecycle", ['node', '--import', 'tsx/esm', 'scripts/verify-channel-owner-lifecycle.ts']],
     ["verify-channel-router-lifecycle", ['node', '--import', 'tsx/esm', 'scripts/verify-channel-router-lifecycle.ts']],
     ["verify-reports-metadata",  ['node', '--import', 'tsx/esm', 'scripts/verify-reports-metadata.ts']],
@@ -464,7 +547,15 @@ const GROUPS = {
     ['verify-preset-startup', ['node', 'scripts/verify-preset-startup.mjs']],
     ['verify-message-compat', ['node', 'scripts/verify-message-compat.mjs']],
     ['verify-settings-compat', ['node', '--import', 'tsx/esm', 'scripts/verify-settings-compat.mjs']],
+// 设置读点的 ns 归属（issue #1124）：分区注册与写入用 Config owner 的 Loader id
+// （可为自定义 id），读点（channel.autoRecapOnOpen、Chat 的 lang 镜像、/reload 的
+// langOverriddenBySettings）必须用同一个 ns —— 写死 'dsh-tui' 会让非默认挂载
+// 「写得进、读不回」，自动回顾永远关不掉。
+    ["verify-settings-namespace", ['node', '--import', 'tsx/esm', 'scripts/verify-settings-namespace.ts']],
     ["verify-compact", ['node', '--import', 'tsx/esm', 'scripts/verify-compact.mjs']],
+    ["verify-compaction-progress", ['node', '--import', 'tsx/esm', 'scripts/verify-compaction-progress.tsx']],
+// #1030：隔离 locale、持久化 /lang 与环境变量，不能靠 CI 的 zh 默认掩盖脚本依赖。
+    ['verify-regression-language', ['node', 'scripts/verify-regression-language.mjs']],
     ["verify-context-warning", ['node', '--import', 'tsx/esm', 'scripts/verify-context-warning.mjs']],
     ["verify-channel-goal-todo", ['node', '--import', 'tsx/esm', 'scripts/verify-channel-goal-todo.mjs']],
 // IDE 选区通道回归（PR #562）：纯函数（env 直连/lock 扫描与 workspace
@@ -473,6 +564,10 @@ const GROUPS = {
 // 选区消费（text 优先/磁盘回退/截断计数/replay 指示回扫）。
     ["verify-ide-channel", ['node', '--import', 'tsx/esm', 'scripts/verify-ide-channel.tsx']],
     ["verify-whale-toggle", ['node', '--import', 'tsx/esm', 'scripts/verify-whale-toggle.mjs']],
+// 开屏大字字体设置（splashFont）：每个 id 解析到自己那款、daily 交回按天轮换、
+// 非法值回落 daily、channel 往返、/settings 选项覆盖全部取值、Config 默认值，
+// 以及 fontId 缝真的换脸（经典款上屏/方板款不在场）。
+    ["verify-splash-font-setting", ['node', '--import', 'tsx/esm', 'scripts/verify-splash-font-setting.mjs']],
 // 开屏鲸鱼三选一（classic 组合开场/heart/sleep）：帧表完整性（22 帧
 // 含 heart/sleep 新调色）、序列合法性（standard 起止/纯自家行为帧、
 // classic 仍捆绑眨眼+喷水+摆尾）、随机选取 API 覆盖/钳制/每次挂载
@@ -511,6 +606,10 @@ const GROUPS = {
 // 丢上下文"事故根因）；persistence 类失败与通用失败分开提示。
     ["verify-compact-switch", ['node', '--import', 'tsx/esm', 'scripts/verify-compact-switch.tsx']],
     ["verify-live-session", ['node', '--import', 'tsx/esm', 'scripts/verify-live-session.ts']],
+// 血缘 × 自动标题回归：/model 在还没有人说过话的会话上不得写 parentSession
+// （上游 first-prompt 标题 provider 只为无 parent 的会话生成标题，fork 永不
+// 重试）；已有对话的源仍必须保留分支血缘，既有 /model 语义不得被削掉。
+    ["verify-session-title-lineage", ['node', '--import', 'tsx/esm', 'scripts/verify-session-title-lineage.ts']],
     ["verify-session-v3", ['node', '--import', 'tsx/esm', 'scripts/verify-session-v3.ts']],
     ["verify-session-tree-generations", ['node', '--import', 'tsx/esm', 'scripts/verify-session-tree-generations.ts']],
 // 裸 ● 空行回归：纯思考/纯工具步骤（无文本块）的 assistant/message
@@ -543,6 +642,10 @@ const GROUPS = {
 // 子代理模型路由回归（issue #191）：child scope 没有 AgentOptions 路由时，
 // 首次请求继承 TUI 当前完整路由；显式 child 路由保持优先。
     ["verify-subagent-model-route", ['node', '--import', 'tsx/esm', 'scripts/verify-subagent-model-route.tsx']],
+// 子代理面板同步回归（issue #966）：catalog/workflow 持久发现、重派 runId
+// 分代（含上一 epoch 迟到 end 不得错杀）、resume 日志 bootstrap（历史行
+// 不进转录）、会话绑定延迟愈合与 peer 会话不污染。
+    ["verify-subagent-panel-sync", ['node', '--import', 'tsx/esm', 'scripts/verify-subagent-panel-sync.tsx']],
 // 子进程 stderr 接管回归（issue #17）：inherit 的 MCP 子进程 stderr
 // 不再裸写终端破坏 alt-screen，输出去重聚合为受控通知。
     ["verify-child-stderr", ['node', '--import', 'tsx/esm', 'scripts/verify-child-stderr.tsx']],
@@ -554,6 +657,8 @@ const GROUPS = {
 // 匹配、北京时间高峰/空闲时段边界、缓存命中计价、未知模型与零 token
 // 不估算、官方 provider 判定。注入 fake fetch，不发真实请求。
     ["verify-balance", ['node', '--import', 'tsx/esm', 'scripts/verify-balance.tsx']],
+// 本会话费用估算回归（#1089）：主会话按模型分桶 + 子代理按各自 (provider, model)、峰值/空闲、缓存分项合并计价，非官方/未收录只报 token 并标注未计价。
+    ["verify-session-cost", ['node', '--import', 'tsx/esm', 'scripts/verify-session-cost.tsx']],
 // /model 二级选择器派生回归：provider 分组（首现排序、显示名回退、
 // 计数）与落焦规则（多 provider 聚焦当前组、单 provider 直达模型层、
 // 缺席当前 provider 落首行）。键盘与 overlay 归约由 verify-chat-overlay
@@ -625,6 +730,9 @@ const GROUPS = {
 // 树内每个测量所依据的宽度失效，而没有任何节点被标脏，文本节点会沿用
 // 旧宽度的测量结果，靠 flex 仲裁的行因此由两套布局拼成。
     ["verify-resize-reflow", ['node', '--import', 'tsx/esm', 'scripts/verify-resize-reflow.tsx']],
+// 上下文进度条右对齐回归（#922）：页脚根 Box paddingX={1} ⇒ 内容区实宽
+// columns - 2，bar 也必须按 columns - 2 取宽——右端与状态行右缘逐格比对。
+    ["verify-context-bar-alignment", ['node', '--import', 'tsx/esm', 'scripts/verify-context-bar-alignment.tsx']],
 // Ctrl+T 归属回归：启动上下文面板在屏时该键属于面板（它自己在屏幕上
 // 印着「Ctrl+T 展开」），转录有行之后才归轨迹场景。两者永不同屏——
 // 面板只在首条消息前出现，而那正是轨迹为空的窗口。
@@ -635,7 +743,9 @@ const GROUPS = {
     ["repro-collapse-shrink", ['node', '--import', 'tsx/esm', 'scripts/repro-collapse-shrink.tsx']],
 // /provider 向导回归：catalog/custom 两分支的 profile 形状、凭据回滚
 // （覆盖时恢复旧 key 而非误删）、env shadow 跳过、rc.6 兼容守卫、
-// hideCustomInput 逐题标记。
+// hideCustomInput 逐题标记；模型列表编辑的双通道发现（内置目录 + 无
+// provider 字段的端点实拉）合并、线上新增标记、目录外 id 容量写入、
+// 实拉失败降级与匿名探测请求形状。
     ["verify-provider-wizard", ['node', 'scripts/verify-provider-wizard.mjs']],
 // /login 凭据状态回归（issue #213）：只通过 credentials.describe()
 // 展示 configured/source/writable，managed key 不得误报或泄露值。
@@ -655,6 +765,13 @@ const GROUPS = {
 // 长问卷列表回归：24 行终端中的 36 个两行 provider 选项必须围绕
 // focusIndex 窗口化，初始和深度导航后焦点 label/单选标记始终可见。
     ["verify-askpanel-long-list", ['node', '--import', 'tsx/esm', 'scripts/verify-askpanel-long-list.tsx']],
+// 问卷作答记录的真源投影回归（issue #1009）：ask_user_question 不渲染工具卡，
+// 它的 tool/result 必须自己折叠出作答记录——实时一条、重放（/resume、rewind、
+// 模型切换）同一条、同 callId 不重复、错误结果渲染日志里的错误文本（ASK_CANCELLED/
+// ASK_ABORTED 不得伪造答案）、redact 仍只在本地向导打码、不可解析的载荷退化成
+// 只有标题而不抛异常中断投影。修复前记录只由面板「开→关」那一跳 pushLocal 推送，
+// 重放后必丢。
+    ["verify-question-transcript-record", ['node', '--import', 'tsx/esm', 'scripts/verify-question-transcript-record.tsx']],
 // 长 plan-review 正文回归（issue #413）：24 行终端里 40 段 plan 不得把
 // Approve/反馈顶出屏外；滚轮必须滚 plan body（直接面板 + 挂进 Chat）。
     ["verify-plan-review-scroll", ['node', '--import', 'tsx/esm', 'scripts/verify-plan-review-scroll.tsx']],
@@ -768,12 +885,28 @@ for (const entry of group) {
   console.log('\n===== ' + name + ' =====')
   const renderLog = join(RENDER_LOG_DIR, name + '.log')
   rmSync(renderLog, { force: true })
+  // One throwaway HOME per script: fixtures used to share the machine's real
+  // home, so a script that submits text left entries in
+  // `~/.dsh-tui/history.jsonl` for whatever ran next — and `↑` walks that file
+  // (#986), which turned one script's leftovers into the next script's
+  // assertion failure. A local group run must also never write the runner's
+  // own history. `HOME`/`USERPROFILE` sit after `env` (which carries the real
+  // ones) so the real home can never win; an entry may still override them
+  // through its own `extraEnv`.
+  const scriptHome = mkdtempSync(join(tmpdir(), 'dsh-tui-group-home-'))
   const startedAt = performance.now()
   const r = spawnSync(argv[0], argv.slice(1), {
-    env: { DSH_TUI_RENDER_LOG: renderLog, ...env, ...(extraEnv ?? {}) },
+    env: {
+      DSH_TUI_RENDER_LOG: renderLog,
+      ...env,
+      HOME: scriptHome,
+      USERPROFILE: scriptHome,
+      ...(extraEnv ?? {}),
+    },
     stdio: 'inherit',
     shell: false,
   })
+  rmSync(scriptHome, { recursive: true, force: true })
   const seconds = (performance.now() - startedAt) / 1000
   const failed = r.status !== 0
   results.push({ name, failed, status: r.status, seconds })

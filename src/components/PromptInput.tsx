@@ -32,7 +32,7 @@ import type {
 } from '../dsh-adapter/channel.js'
 import type { TranscriptImage } from '../dsh-adapter/transcript-images.js'
 import { isHiddenCommandName, parseCommandName } from '../commands.js'
-import { appendHistory } from '../history.js'
+import { appendHistory, HISTORY_LIMIT, loadHistoryOldestFirst } from '../history.js'
 import { mentionAtCaret } from '../utils/mentions.js'
 import { preserveSelection, type FileCandidate } from '../utils/fileSuggestions.js'
 import { isMod } from '../utils/modifiers.js'
@@ -49,8 +49,6 @@ import {
   type PromptDraftCache,
   type PromptDraftImage,
 } from './promptDraftCache.js'
-
-const HISTORY_LIMIT = 50
 
 /**
  * Visible text of the session-entry control at the head of the input row:
@@ -109,15 +107,59 @@ const isBigInput = (text: string): boolean =>
  */
 const EDITABLE_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f]/u
 
-/** Normalize editable text so no terminal control characters remain in state. */
-function sanitizeEditableText(text: string): string {
+/**
+ * Raw win32-input-mode records (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`) that reached the
+ * editable buffer as text instead of being translated. `stripAnsi` consumes
+ * the record head and leaves its terminating `_` in the draft — the stray
+ * underscore users see after a multi-line paste (issue #1090). Only the full
+ * record grammar (exactly five `;` separators) matches, so a real `_` and
+ * ordinary bracket text survive untouched.
+ */
+const WIN32_RECORD_RESIDUE = /\u001b\[\d*(?:;\d*){5}_/gu
+
+/**
+ * The same record with its ESC byte missing: what a record split across
+ * reads leaves behind when the escape timer flushed the prefix before the
+ * tail arrived. Printable, so it is stripped only from paste payloads
+ * ({@link sanitizePastedText}) — and only when the same payload also carries
+ * a full ESC-bearing record as in-payload evidence of that split; typed text
+ * and literal clipboard/bracketed-paste bytes are left untouched.
+ */
+const WIN32_RECORD_RESIDUE_TAIL = /\[\d*(?:;\d*){5}_/gu
+
+/**
+ * Normalize editable text so no terminal control characters remain in state.
+ */
+export function sanitizeEditableText(text: string): string {
   // Fast path for ordinary and multi-line drafts: newline is intentionally
-  // absent from the probe, so a large clean paste returns without regex work.
+  // absent from the probe, so large clean text returns without the
+  // stripAnsi/control-normalization passes.
   if (!EDITABLE_CONTROL.test(text)) return text
-  return stripAnsi(text)
+  // Record residue goes first: `stripAnsi` would consume the CSI head and
+  // leave only the terminating `_` behind.
+  return stripAnsi(text.replace(WIN32_RECORD_RESIDUE, ''))
     .replace(/\r\n?/gu, '\n')
     .replace(/\t/gu, '        ')
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '')
+}
+
+/**
+ * Paste-payload ingress: strip the ESC-less tail of a split record before
+ * normalizing. The tail is printable, so it survives `sanitizeEditableText`'s
+ * control probe untouched; typed text keeps it because only a paste payload
+ * can carry a partial record.
+ *
+ * The five separators only prove the *shape*, not that a record was split:
+ * a user can legitimately paste the literal `[13;28;13;1;0;1_`. Strip the
+ * ESC-less form only when the same payload also carries a full ESC-bearing
+ * record — only then is there in-payload evidence of a split stream.
+ * Otherwise the bytes are ordinary text and must survive verbatim.
+ */
+export function sanitizePastedText(text: string): string {
+  // Probe with String#match: the /g detection regex carries lastIndex state
+  // across `.test` calls, so a previous success could skip a later match.
+  const hasRecordStream = text.match(WIN32_RECORD_RESIDUE) !== null
+  return sanitizeEditableText(hasRecordStream ? text.replace(WIN32_RECORD_RESIDUE_TAIL, '') : text)
 }
 
 const COMPOSER_IMAGE_TOKEN = /\[Image #\d+\]/gu
@@ -730,6 +772,8 @@ export function PromptInput({
   const history = React.useRef<PromptHistoryEntry[]>([])
   const historyIndex = React.useRef(-1)
   const historyDraft = React.useRef<PromptHistoryEntry>({ text: '', images: [] })
+  /** The persisted history is read lazily, once per mount (see seedHistory). */
+  const historySeeded = React.useRef(false)
   /** Visible `[Image #N]` labels are presentation only; this sidecar carries
    * the non-reusable capability for the current draft. History/rewind text
    * restored without this map can never bind to a later image by accident. */
@@ -1301,7 +1345,26 @@ export function PromptInput({
     }
   }
 
+  /**
+   * Seed the walk with the persisted history (issue #986). `↑`/`↓` used to
+   * see only what this process submitted, so a restart lost every earlier
+   * entry. Seeding before the first push keeps ONE chronological list —
+   * persisted entries first, this run's submits behind them — instead of two
+   * lists to merge at recall time. Restored text carries no image capability
+   * (the file stores text only), which is also what keeps a recalled entry
+   * from binding to a later staged image by accident.
+   */
+  const seedHistory = (): void => {
+    if (historySeeded.current) return
+    historySeeded.current = true
+    history.current = loadHistoryOldestFirst().map(entry => ({ text: entry.text, images: [] }))
+    historyIndex.current = -1
+  }
+
   const rememberHistory = (text: string, images: readonly ComposerImageRef[]): void => {
+    // Both entries into the walk (a submit and ↑) must see the persisted
+    // prefix, so seed here rather than merging two lists later.
+    seedHistory()
     history.current.push({
       text,
       images: images.map(image => ({ ...image })),
@@ -1413,6 +1476,28 @@ export function PromptInput({
     setSelectedCommand(0)
     setFileSelected(0)
     channel.notify(t('input-retracted'), { timeoutMs: 2000 })
+  }
+
+  /**
+   * Withdraw the queued copy of the text `↑` just recalled (issue #986): the
+   * message is still parked in the inbox, so editing it and sending again
+   * would run the same text twice. Alt+Up withdraws explicitly; walking the
+   * history to the same text has to land in the same place. The newest match
+   * wins — `↑` walks newest-first and the queue is FIFO. A message the
+   * running turn already claimed cannot be withdrawn, and saying so beats
+   * pretending it was.
+   */
+  const retractRecalledCopy = (text: string): void => {
+    let target: (typeof channel.pending)[number] | undefined
+    for (const item of channel.pending) {
+      if (item.text === text) target = item
+    }
+    if (target === undefined) return
+    if (channel.removePending(target.id)) {
+      channel.notify(t('input-retracted'), { timeoutMs: 2000 })
+    } else {
+      channel.notify(t('input-cannot-retract'), { color: 'warning', timeoutMs: 2500 })
+    }
   }
 
   /**
@@ -1867,7 +1952,7 @@ export function PromptInput({
     // Newlines remain data — they are NOT Enter — so this branch runs before
     // the whole-line submit rule.
     if (event?.isPasted && input.length > 0) {
-      const text = sanitizeEditableText(input.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+      const text = sanitizePastedText(input.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
       // Desktop drops reach the TUI as pasted text (Ghostty forwards
       // Shell.escape(path) through the PTY with no drop boundary). Only a
       // paste that IS one unambiguous existing local image path stages as
@@ -1931,7 +2016,7 @@ export function PromptInput({
               return
             }
             if (content.kind === 'unavailable') {
-              channel.notify(t('input-clipboard-unavailable'), { color: 'warning' })
+              channel.notify(t(content.wsl === true ? 'input-clipboard-unavailable-wsl' : 'input-clipboard-unavailable'), { color: 'warning' })
               return
             }
             if (content.kind === 'image') {
@@ -2018,7 +2103,7 @@ export function PromptInput({
             if (!draftImageLeaseIsCurrent(lease)) return
             // Insert against the LIVE input state: the read above resolved
             // asynchronously and the user may have typed while waiting.
-            const text = sanitizeEditableText(formatClipboardInsert(content))
+            const text = sanitizePastedText(formatClipboardInsert(content))
             const { at } = insertClipboardAtCaret(text)
             // Same fold as bracketed paste — but never inside the expanded
             // editor (plain text there, see the isPasted branch).
@@ -2304,6 +2389,7 @@ export function PromptInput({
         )
         return
       }
+      seedHistory()
       if (history.current.length === 0) return
       if (historyIndex.current < 0) {
         historyDraft.current = {
@@ -2316,6 +2402,7 @@ export function PromptInput({
       }
       const entry = history.current[historyIndex.current]
       if (entry === undefined) return
+      retractRecalledCopy(entry.text)
       updateFoldBlock(null)
       restoreDraftImages(entry)
       setInput(entry.text)

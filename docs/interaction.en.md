@@ -116,6 +116,8 @@ text and newlines, and is never mistaken for an Enter key. To keep rendering, cl
 mapping, and selection geometry consistent:
 
 - Terminal ANSI controls are stripped on entry.
+- A multi-line paste no longer leaves a stray `_`: when a Windows terminal delivers the paste as win32-input-mode records, the residue (`ESC[Vk;Sc;Uc;Kd;Cs;Rc_`, or the ESC-less tail left by a split record) is stripped whole on entry. Only the five-separator record grammar matches, so genuine underscores and bracket text that merely resembles a record are untouched.
+- Pasted CRLF collapses: a CR+LF pair produces one newline instead of two; LF-only and lone CR keep their previous behavior.
 - Tabs are expanded to spaces on entry.
 
 ### Fullscreen draft editor (`Ctrl+Shift+E` / `⛶`)
@@ -257,8 +259,19 @@ brings it back.
 | `Ctrl+N` | Start a session in the workspace under the cursor |
 | `Ctrl+X` | Stop the **background** session under the cursor (the attached one cannot be stopped) |
 | `Ctrl+L` | Re-read the workspace registry and the session listing |
-| `Shift+Tab` | Rail: open the action menu of the workspace under the cursor |
+| `Tab` / `Shift+Tab` | Next / previous source tab (when other agents have sessions) |
 | `Esc` | Dismiss a notice → clear the filter → leave the screen |
+
+The right side of the title row is the **source strip**: `DSH │ Claude Code  Codex …`.
+
+- A tab appears only for another coding agent on this machine (Claude Code, Codex, Grok Build, zcode) that has conversations, in a fixed order; with none, there is no strip. Opening the screen only checks whether each source has any conversation; a source's list is read when its tab is opened.
+- The screen always opens on `DSH`; click a tab or press `Tab` / `Shift+Tab` to switch, which clears the filter.
+- On a narrow terminal the subtitle goes first, then trailing tabs fold into `+N` (click it for the rest); the active tab never folds.
+- A source tab has the same two columns: the rail groups conversations by working directory (a registered directory keeps its workspace name; conversations with no recorded directory share an "Unknown directory" group), and the list shows that directory's conversations, filtered live by title and directory.
+- There is no new-session card; `Enter` or a click **imports and opens** — just that one conversation is written into the DSH session store and entered. A conversation imported before opens directly, without a second copy.
+- If the conversation's working directory no longer exists, nothing is imported and the notice line says so.
+- On a source tab `Ctrl+N`, `Ctrl+X` and pins do nothing; `Ctrl+L` rescans the source.
+- The import uses the same parsing and deterministic ids as `/migrate`, so both entries land a conversation on the same DSH session.
 
 The rail's menu has four entries:
 
@@ -380,6 +393,8 @@ A full-screen scene (no scrollback pollution) over the whole session timeline:
 
 `/model` switches through a session fork at the end of current history, because DSH has no in-place model-switch API. The old session remains in `/resume`.
 
+- A session nobody has typed into records no branch: switching models there yields an independent session with no `parentSession` (inheriting the same session-scaffolding prefix), so the first real prompt you send still triggers automatic session-title generation. A session that already holds a conversation keeps its lineage as before.
+
 - `/preset` switches in place only for a blank session. In a started session, the choice becomes the default for the next `/new` or launch.
 
 See [Configuration](configuration.en.md#agent-presets).
@@ -499,6 +514,7 @@ When the model invokes the questionnaire tool, its panel temporarily owns the ke
 | `Space` | Toggle a multi-select option |
 | `Tab` | Switch to a custom text answer |
 | `Enter` | Submit the current question |
+| `Left` / `Right` | Switch questions and keep the current draft (does not submit). On the free-text row, arrows still move the caret; they switch questions only when the caret is already at the start or end |
 | `Esc` (from question 2 onward) | Return to the previous question and keep the current draft |
 | `Esc` (from question 1) | Cancel the whole batch; the model receives `ASK_CANCELLED` |
 | `Ctrl+C` | Cancel the whole batch from any question; the model receives `ASK_CANCELLED` (a harness-side abort still reports `ASK_ABORTED`) |
