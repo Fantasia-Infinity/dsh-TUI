@@ -15,7 +15,7 @@
  * - controls: permission modes and presets, model / preset / effort, manual
  *   compaction, the model-selection waterfalls and the child-route fill;
  * - reports: `/doctor`, `/export` (from the log), `/mcp`, `/init`, `/balance`,
- *   `/plugins`, `/login` credential descriptions.
+ *   `/plugin`, `/login` credential descriptions.
  *
  * Construction order matters where it is observable: the job feed and
  * pricing are installed before the seed replay, the replay runs before the
@@ -25,7 +25,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { t } from '../../i18n.js'
-import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { DshNative } from '../../agent/capabilities.js'
@@ -34,10 +34,12 @@ import { channelCapabilities } from '../../channel/capabilities.js'
 import { isCommandCompletionToken, LOCAL_COMMANDS } from '../../commands.js'
 import { touchSession } from '../../sessionHistory.js'
 import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
+import { installedMeetsVersion } from '../contract.js'
 import { createDshSession } from '../backend/session.js'
 import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
 import { getHostMessageObserver, type TuiMessageObserverRuntime } from '../message-observer.js'
 import { createForeignBrowser } from '../migrate/browse.js'
+import { createPluginCompletionCatalog } from '../plugin-completions.js'
 import type { JobsRuntime } from '../jobs.js'
 import { listSummaries, noteBranch, type SessionSource, type SessionSummary } from '../sessions/index.js'
 import type { ChannelActionDelegates } from './action-readiness.js'
@@ -55,6 +57,7 @@ import { createDetachedHandleFactory } from './lifetime-resources.js'
 import { createLoadedContextRefresher } from './loaded-context.js'
 import { createLocalActions } from './local-actions.js'
 import { mentionAttachments } from './mentions.js'
+import { createModelSelection } from './model-selection.js'
 import { createModelActions } from './model-actions.js'
 import { createModelSwitchAction } from './model-switch.js'
 import { createPermissionModeActions } from './mode-permission-actions.js'
@@ -74,6 +77,7 @@ import { createSkillCatalog } from './skill-catalog.js'
 import { createSubagentProjection, type SubagentsServiceView } from './subagent-projection.js'
 import { readChildTranscriptPage } from './subagent-transcript.js'
 import { DSH_BACKEND_LABEL, type ChannelLaunchOptions } from './state.js'
+import { ensureUpstreamRetry } from './upstream-retry.js'
 import { foldBack } from './transcript.js'
 import type { BackgroundResult, ResumeResult } from './types.js'
 import { createWorkspaceActions } from './workspace-actions.js'
@@ -95,8 +99,9 @@ async function listSessionsSnapshot(ctx: Context): Promise<readonly SessionSumma
 
 /**
  * Attach the DSH specialists to a core whose bound session is a DSH session.
- * Called inside `createChannel`'s construction transaction: a throw here is
- * rolled back by the caller through the core's owner.
+ * Called inside `createChannel`'s construction transaction, or inside the
+ * adoption that binds a placeholder's DSH session (`core.extendOnAdopt`); a
+ * throw fails either. The binding already holds the DSH session.
  */
 export function attachDshExtensions(
   core: CoreChannel,
@@ -116,6 +121,20 @@ export function attachDshExtensions(
     if (native === undefined) throw new Error('dsh-tui: the bound session is not a DSH session')
     return native
   }
+  // Upstream auto-retry seeding (upstream-retry.ts), scoped to the route
+  // the bound session actually uses: the binding feed calls this on every
+  // bind (boot, resume) and /model calls it for the route it selects. The config gate defaults on,
+  // observational (shadow) compositions never write settings, and the
+  // fire-and-forget promise never blocks a bind.
+  const upstreamRetryAttempted = new Set<string>()
+  const seedUpstreamRetry = (provider: string | undefined): void => {
+    if (options.upstreamRetry === false) return
+    if (adapterRuntime.mode === 'passive-shadow' || adapterRuntime.mode === 'replay-shadow') return
+    if (provider === undefined || provider === '' || upstreamRetryAttempted.has(provider)) return
+    upstreamRetryAttempted.add(provider)
+    void ensureUpstreamRetry(ctx, notify, [provider])
+  }
+
   // Detached work (/fork and agent-view dispatch) is owned until a caller
   // explicitly transfers the temporary handle to its destination ledger.
   const createDetachedHandle = createDetachedHandleFactory(owner)
@@ -175,6 +194,7 @@ export function attachDshExtensions(
   // service attachment has no authority after its injected lifetime ends.
   const jobProjection = createJobProjection(() => state, {
     owner, notify: (...args) => notify(...args), rowIds, agent: () => binding.agent, steer: text => channelCommands(state).steer(text),
+    history: () => dshNative().rawHistory(),
   })
 
   // The DSH slash-command registry (optional service): /plan, /goal and
@@ -235,7 +255,7 @@ export function attachDshExtensions(
     configurable: true,
     enumerable: true,
     get(): boolean {
-      const settings = ctx.get('settings') as
+      const settings = (options.settingsService ?? ctx.get('settings')) as
         | { describe(options?: { redactSecrets?: boolean }): readonly { ns: string; value: unknown }[] }
         | undefined
       if (settings === undefined) return false
@@ -322,8 +342,8 @@ export function attachDshExtensions(
   const resetProjection = core.feed.resetProjection
   const projector = core.feed.projector
 
-  // Model selection is installed by bind; route/effort state is owned by model-actions.
-  const selection: ModelSelectionRef = { current: undefined, assembled: undefined }
+  const modelSelection = createModelSelection(ctx, { owner, agent: () => binding.agent })
+  const { selection } = modelSelection
   // Registry command policy and rc.8 image encoding are an owner-scoped module.
   const externalCommands = createExternalCommandInvoker(ctx, {
     commandService,
@@ -389,6 +409,9 @@ export function attachDshExtensions(
       state.emit()
     },
     commandDescriptions: name => commandTrees?.descriptions(name),
+    // A skill gesture typed mid-turn stays immediate (steer at the next step
+    // boundary) instead of degrading into a turn-end followup (issue #1072).
+    working: () => state.working,
     // Attached-context pass-through: the skill catalog never loses the
     // FIFO/decision fence.
     deliverUserText: (text, placement, attach) => core.input.deliverUserText(text, placement, [], attach),
@@ -409,9 +432,13 @@ export function attachDshExtensions(
     grantStore: host.currentGrantStore,
   })
   const foreignBrowser = createForeignBrowser(() => ctx.get('sessionPersistence'), owner.signal)
+  // `/plugin info <name>` reads the same host service the report does (an
+  // absent service answers an empty popup, never a throw).
+  const pluginCompletions = createPluginCompletionCatalog(ctx, { owner, emit: () => state.emit() })
   const sessionMetadataActions = createSessionMetadataActions(ctx, {
     owner,
     binding,
+    cwd: () => state.cwd,
     provider: () => state.provider,
     model: () => state.model,
     emit: () => state.emit(),
@@ -471,20 +498,11 @@ export function attachDshExtensions(
   const switchModelAction = createModelSwitchAction(ctx, state, {
     owner,
     binding,
-    rowIds,
-    // Compaction is installed below before the channel binds or exposes input.
-    settleCompaction: () => settleManualCompaction(),
-    resetProjector: resetProjection,
-    resetSubagents: subagentProjection.reset,
-    resetJobs: jobProjection.reset,
-    replay: replaySessionSeed,
-    settleReplay: projector.settleStreaming,
-    bindAgent: () => bindAgent(),
-    refreshCommands: refreshCommandList,
-    refreshLoadedContext,
-    refreshSkillCommands,
-    clearStagedImages,
+    selection,
+    supportsRouteSwitch: installedMeetsVersion('@deepseek-ai/dsh-agent', '0.1.2-alpha.3'),
+    applyPreferredEffort: () => modelActions.applyPreferredEffort(),
     dropModelCompletion: () => modelActions.dropModelNodeCache(),
+    seedUpstreamRetry,
     notify,
   })
 
@@ -513,8 +531,8 @@ export function attachDshExtensions(
   })
 
   // Event subscription routing is a distinct binding owner. Its hooks run in
-  // every core bind: owner-level child listeners once, then per binding the
-  // activity seed, the model selection waterfalls and the raw subscribers.
+  // every core bind: owner-level child listeners once, then the activity seed,
+  // activation of that agent's model selection, and foreground raw subscribers.
   const bindingEvents = createBindingEvents(ctx, {
     owner,
     binding,
@@ -522,13 +540,15 @@ export function attachDshExtensions(
     seedActivity: options.seedActivity,
     seedContextOccupancy: options.seedContextOccupancy,
     inputConvergence: core.inputConvergence,
-    selection,
+    modelSelection,
     modelActions,
     modeActions,
     projector,
     subagents: subagentProjection,
+    jobs: jobProjection,
     agentView,
     messageObserver,
+    seedUpstreamRetry,
     retireAttachment: core.input.retireAttachment,
   })
 
@@ -734,7 +754,7 @@ export function attachDshExtensions(
   } satisfies Omit<ChannelActionDelegates, CoreServedAction>
 
   core.extend({
-    completions: { workspaceCommands: () => workspaceService.commands(), model: modelActions },
+    completions: { workspaceCommands: () => workspaceService.commands(), model: modelActions, plugin: pluginCompletions },
     bind: {
       ...bindingEvents.hooks,
       // Re-anchor the job projection after every bind: its event

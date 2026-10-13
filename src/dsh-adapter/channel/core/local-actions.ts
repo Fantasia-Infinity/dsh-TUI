@@ -5,7 +5,7 @@
  * restore only works when the backend can slice its own durable history;
  * otherwise nothing is ever folded and the action restores 0 rows.
  */
-import type { Context } from '@deepseek-ai/cordis'
+import type { ServiceLookup } from '../channel-host.js'
 import { randomUUID } from 'node:crypto'
 import { markChannelReadDirty } from '../../../adapter/channel/read-view.js'
 import { writeActivityFrames } from '../../../activityPrefs.js'
@@ -37,7 +37,7 @@ export function setActivityFrames(
   return true
 }
 
-export function createCoreLocalActions(ctx: Context, deps: {
+export function createCoreLocalActions(ctx: ServiceLookup, deps: {
   owner: Pick<ChannelOwner, 'current'>
   binding: Pick<ChannelBinding, 'capture' | 'isCurrent'>
   state: ChannelState
@@ -77,9 +77,12 @@ export function createCoreLocalActions(ctx: Context, deps: {
       state.emit()
     },
 
-    pushLocal(title: string, lines: readonly string[]): void {
+    pushLocal(title: string, lines: readonly string[], options?: { readonly lineLimit?: number }): void {
+      // A report whose line IS the payload (the /goal objective) raises the
+      // budget; every other report keeps the shared 240-cell preview.
+      const limit = options?.lineLimit ?? LOCAL_OUTPUT_LIMIT
       state.rows.push({ id: rowIds.value++, kind: 'local', text: title })
-      for (const line of lines) state.rows.push({ id: rowIds.value++, kind: 'local-output', text: preview(line, LOCAL_OUTPUT_LIMIT) })
+      for (const line of lines) state.rows.push({ id: rowIds.value++, kind: 'local-output', text: preview(line, limit) })
       state.emit()
     },
 

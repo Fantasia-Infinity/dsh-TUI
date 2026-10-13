@@ -11,6 +11,7 @@ import type { DOMElement } from '../ink/dom.js'
 import { Divider } from './design-system/Divider.js'
 import { UserPromptMessage } from './messages/UserPromptMessage.js'
 import { AssistantTextLeafRow, ThinkingLeafRow, ToolLeafRow } from './messages/TranscriptLeaves.js'
+import { liveOutputMaxLines, liveOutputRows } from './messages/liveOutputLines.js'
 import { SubagentMessage } from './Chat/SubagentMessage.js'
 import { JobCard } from './Chat/JobCard.js'
 import { JobGroupHeader } from './Chat/JobGroupHeader.js'
@@ -211,6 +212,7 @@ function signatureParts(
   failureHint: string | undefined,
   displayTextLen: number,
   sessionCwd: string | undefined,
+  fullscreen: boolean,
 ): Array<string | number | boolean> {
   signatureScratch.length = 0
   // Universal height inputs: width reflows every row; kind switches height
@@ -255,6 +257,12 @@ function signatureParts(
         row.folded === true,
         tool?.resultView?.card ?? '',
         row.id === failureHintRowId ? failureHint ?? '' : '',
+        // Live output rows of a running call (omitted header + lines): the
+        // count saturates once the tail fills the card's window, so a
+        // steady stream stops invalidating the cached height.
+        tool?.status === 'running'
+          ? liveOutputRows(tool.liveOutput, tool.liveOutputDropped ?? 0, liveOutputMaxLines(expanded || expandedRows.has(row.id), fullscreen))
+          : 0,
       )
       break
     }
@@ -361,6 +369,7 @@ export function MessageList({
   olderHistory,
   thinkingVisible = true,
   historyPaintEnabled = true,
+  fullscreen = false,
   registerRowRef,
   scrollHandle,
   forceMountRowId,
@@ -433,6 +442,8 @@ export function MessageList({
    * seconds of lex/highlight/layout before first paint).
    */
   historyPaintEnabled?: boolean
+  /** Fullscreen layout: running tool cards show more live output lines. */
+  fullscreen?: boolean
   /** Transcript search: register each row's DOM element for scroll-to-match. */
   registerRowRef?: (rowId: number, el: DOMElement | null) => void
   /** Scroll viewport the list virtualizes against. */
@@ -844,9 +855,10 @@ export function MessageList({
   // change feeds topPad/bottomPad spacers, the offsets scan, and the
   // ScrollBox clamps with geometry that no longer exists — blank bands,
   // overlapping rows, wrong scrollTop after toggles (the audit's stale
-  // height cache). Track the inputs that decide each row's height; when
-  // one changes, drop the cached height. The window extension further
-  // down remounts invalidated rows so useLayoutEffect re-measures them.
+  // height cache). Track the inputs that decide each row's height; changes
+  // invalidate the cache, except text-only growth of an active stream keeps
+  // its last measured estimate until the mounted row is re-measured. The
+  // window extension remounts invalidated rows for useLayoutEffect to measure.
   // Text identity uses length as an O(1) proxy — per-frame full-text
   // hashing over every row would defeat virtualization's budget, and a
   // same-length miss only degrades to the previous behavior.
@@ -857,6 +869,7 @@ export function MessageList({
   // render was O(rows) garbage per tick (3200-row session ⇒ several MB/s
   // into minor GC; the GC share of the scroll profile).
   const sigRef = React.useRef(new Map<number, Array<string | number | boolean>>())
+  let growingStreamNeedsMeasure = false
   {
     const sigs = sigRef.current
     for (let i = 0; i < visibleRows.length; i++) {
@@ -882,6 +895,7 @@ export function MessageList({
         failureHint,
         revealDisplayLen(row, smoothStreaming),
         sessionCwd,
+        fullscreen,
       )
       const cachedParts = sigs.get(row.id)
       let same = false
@@ -898,7 +912,16 @@ export function MessageList({
       }
       // Copy out of the module-level scratch buffer — the next row reuses it.
       sigs.set(row.id, parts.slice())
-      heightsRef.current.delete(row.id)
+      // Keep a streaming row's last measured extent when only its text grows.
+      // If it leaves the mount window before the next measurement, falling
+      // back to DEFAULT_ROW_HEIGHT would manufacture a content collapse.
+      const growingStream = row.streaming === true && cachedParts !== undefined &&
+        parts.length === cachedParts.length &&
+        typeof parts[2] === 'number' && typeof cachedParts[2] === 'number' && parts[2] >= cachedParts[2] &&
+        parts.every((part, index) => index === 2 || part === cachedParts[index])
+      if (!growingStream) heightsRef.current.delete(row.id)
+      // Retaining the estimate must not skip the next fresh Yoga read.
+      else if (localRefs.current.has(row.id)) growingStreamNeedsMeasure = true
       heightsVersionRef.current++
     }
   }
@@ -1372,7 +1395,7 @@ export function MessageList({
         )
       }
     }
-    if (changed && measureTimerRef.current === null) {
+    if ((changed || growingStreamNeedsMeasure) && measureTimerRef.current === null) {
       // Layout corrections can cascade for many rows. Yield to the next
       // macrotask so React does not count the valid convergence as nested
       // updates when a streaming/reveal commit is already in flight.
@@ -1454,6 +1477,7 @@ export function MessageList({
               rowId={row.id}
               kind={row.kind}
               text={displayText}
+              interruptBackend={row.interruptBackend}
               images={row.images}
               textFull={row.kind === 'reasoning' ? row.text : undefined}
               executionTarget={row.executionTarget}
@@ -1491,6 +1515,9 @@ export function MessageList({
               toolStartedAt={tool?.startedAt}
               toolDurationMs={tool?.durationMs}
               toolSourceFolded={row.folded === true}
+              toolLiveOutput={tool?.liveOutput}
+              toolLiveOutputDropped={tool?.liveOutputDropped}
+              fullscreen={fullscreen}
               turnUsage={row.turnUsage}
               subagent={subagent}
               job={job}
@@ -1528,6 +1555,7 @@ type MemoRowProps = {
   rowId: number
   kind: ChatRow['kind']
   text: string
+  interruptBackend?: string
   images: readonly TranscriptImage[] | undefined
   /** Reasoning rows: the FULL un-revealed text — the live three-line preview
    *  ticker follows the newest arrived content (never the reveal), while the
@@ -1585,6 +1613,12 @@ type MemoRowProps = {
   /** Row-level source fold (window cap dropped full payloads): the expanded
    *  card discloses preview-only instead of passing it off as full text. */
   toolSourceFolded: boolean
+  /** Live output tail of a running call (a string: every new chunk is a
+   *  new value, so only that card's memo misses) and its dropped count. */
+  toolLiveOutput: string | undefined
+  toolLiveOutputDropped: number | undefined
+  /** Fullscreen layout (running cards show more live output lines). */
+  fullscreen: boolean
   /** Turn-summary payload (kind === 'turn-summary'); set-once immutable
    *  ref created at turn.end, so a plain ref compare is complete. */
   turnUsage: TurnUsageSummary | undefined
@@ -1631,6 +1665,7 @@ function TranscriptRow({
   rowId,
   kind,
   text,
+  interruptBackend,
   images,
   textFull,
   executionTarget,
@@ -1669,6 +1704,9 @@ function TranscriptRow({
   toolStartedAt,
   toolDurationMs,
   toolSourceFolded,
+  toolLiveOutput,
+  toolLiveOutputDropped,
+  fullscreen,
   turnUsage,
   subagent,
   job,
@@ -1868,6 +1906,8 @@ function TranscriptRow({
         resultView: toolResultView,
         startedAt: toolStartedAt,
         durationMs: toolDurationMs,
+        ...(toolLiveOutput === undefined ? {} : { liveOutput: toolLiveOutput }),
+        ...(toolLiveOutputDropped === undefined ? {} : { liveOutputDropped: toolLiveOutputDropped }),
       }
       return (
         <Box flexDirection="column" ref={ref}>
@@ -1890,6 +1930,7 @@ function TranscriptRow({
             onPreviewImage={onPreviewImage}
             suppressImageGraphics={suppressImageGraphics}
             sourceFolded={toolSourceFolded}
+            fullscreen={fullscreen}
           />
         </Box>
       )
@@ -1903,7 +1944,7 @@ function TranscriptRow({
     case 'interrupt':
       return (
         <Box marginTop={1} ref={ref}>
-          <TurnInterruptedRow />
+          <TurnInterruptedRow backendLabel={interruptBackend} />
         </Box>
       )
     case 'turn-summary':

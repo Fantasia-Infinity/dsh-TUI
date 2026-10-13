@@ -16,7 +16,7 @@
  * `ownsSessionFacts`, and adds its raw per-binding listeners through
  * `onBind`.
  */
-import type { Context } from '@deepseek-ai/cordis'
+import type { ChannelHostLogger } from '../channel-host.js'
 import type { AgentEvent, AgentEventMeta, AgentEventOf } from '../../../agent/events.js'
 import type { AgentSession } from '../../../agent/session.js'
 import { attachInteraction } from '../../../channel/interaction.js'
@@ -26,6 +26,7 @@ import type { BindingCapture, ChannelBinding } from '../binding.js'
 import type { InputConvergence } from '../input-actions.js'
 import type { ChannelOwner } from '../owner.js'
 import type { ChannelLaunchOptions } from '../state.js'
+import { createTaskCompletion } from '../task-completion.js'
 import type { ChannelState } from '../types.js'
 import type { SessionControls } from './session-controls.js'
 
@@ -71,6 +72,7 @@ export function createSessionBatchRouter(deps: {
    *  land on the cleared view. Absent = the event is projected (ignored). */
   onReset?(event: AgentEventOf<'session.reset'>): void
   warn(message: string): void
+  taskCompletion?: ReturnType<typeof createTaskCompletion>
 }) {
   const reconcileRetiredProjection = (status: 'idle' | 'disposed'): void => {
     if (!deps.state.working) return
@@ -180,6 +182,7 @@ export function createSessionBatchRouter(deps: {
     }
     if (meta.wake === 'frame') deps.state.emitStream()
     else if (meta.wake !== 'none') deps.state.emit()
+    deps.taskCompletion?.(events, meta, current)
   }
 
   return { route, reconcileRetiredProjection, turnStarts: (): number => turnStarts }
@@ -270,11 +273,11 @@ export function createSessionBinder(deps: {
   return { bind }
 }
 
-export function createBindingFeed(ctx: Context, deps: {
+export function createBindingFeed(ctx: { readonly logger: ChannelHostLogger }, deps: {
   owner: ChannelOwner
   binding: ChannelBinding
   state: ChannelState
-  options: Pick<ChannelLaunchOptions, 'interaction'>
+  options: Pick<ChannelLaunchOptions, 'interaction' | 'onTaskComplete'>
   inputConvergence: InputConvergence
   /** The projector's channel-side dependencies; `jobs` and `pricingWindow`
    *  stay writable until the channel starts (`configureProjection`). */
@@ -290,7 +293,10 @@ export function createBindingFeed(ctx: Context, deps: {
   const { owner, binding, state, inputConvergence, controls } = deps
   // The projector reads its deps per use, so an extension can install its
   // job feed and pricing policy before any event is projected.
-  const projectorDeps: ChannelProjectionDeps = { ...deps.projection, inputConvergence }
+  const projectorDeps: ChannelProjectionDeps = {
+    ...deps.projection, inputConvergence,
+    backendLabel: () => state.backendCapabilities.backendId === 'dsh' ? undefined : state.backendCapabilities.backendLabel,
+  }
   const projector = createChannelProjection(state, projectorDeps)
   const router = createSessionBatchRouter({
     state,
@@ -299,6 +305,7 @@ export function createBindingFeed(ctx: Context, deps: {
     retireAttachment: deps.retireAttachment,
     ...(deps.onReset === undefined ? {} : { onReset: deps.onReset }),
     warn: message => ctx.logger.warn(message),
+    taskCompletion: deps.options.onTaskComplete === undefined ? undefined : createTaskCompletion(state, owner, deps.options.onTaskComplete),
   })
 
   /** Forget every per-session projection ledger: the projector's and the

@@ -94,6 +94,9 @@ export function dshEmits(type: AgentEventType): boolean {
     case 'session.ready':
     case 'session.reset':
     case 'tool.progress':
+    // Optional, unused: DSH tool output reaches the card through the
+    // settled result (and background jobs through task.output).
+    case 'tool.output':
     case 'permission.request':
     case 'permission.settled':
     case 'question.request':
@@ -104,6 +107,7 @@ export function dshEmits(type: AgentEventType): boolean {
     case 'task.update':
     case 'task.end':
     case 'tasks.snapshot':
+    case 'usage':
     case 'context.usage':
     case 'model.changed':
     case 'effort.changed':
@@ -279,6 +283,9 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
       // oxlint-disable-next-line typescript/no-unnecessary-condition -- durable replay data may not match the static type
       if (change === undefined || change.kind !== 'goal/change') return NO_EVENTS
       return [goalChange(change)]
+    }
+    if ((data.source as { kind: string }).kind === 'model-selection') {
+      return [{ type: 'notice', level: 'info', text: textOf(data.content) }]
     }
     // Injected context (plugin/skill source) is model-facing only; it has no
     // transcript-facing text.

@@ -106,7 +106,7 @@ export function createChannelActionMethods(
     workspaceCommands: () => getReadyActions().workspaceCommands(),
     runWorkspaceCommand: (name, input) => getReadyActions().runWorkspaceCommand(name, input),
     switchModel: (provider, model) => getReadyActions().switchModel(provider, model),
-    listEfforts: () => getReadyActions().listEfforts(),
+    listEfforts: route => getReadyActions().listEfforts(route),
     setEffort: id => getReadyActions().setEffort(id),
     setDefaultEffort: id => getReadyActions().setDefaultEffort(id),
     cycleMode: () => getReadyActions().cycleMode(),
@@ -149,7 +149,7 @@ export function createChannelActionMethods(
     cancelCompact: () => getReadyActions().cancelCompact(),
     runExternalCommand: (name, rawInput) => getReadyActions().runExternalCommand(name, rawInput),
     runExternalCommandOutcome: (name, rawInput, images) => getReadyActions().runExternalCommandOutcome(name, rawInput, images),
-    pushLocal: (title, lines) => getReadyActions().pushLocal(title, lines),
+    pushLocal: (title, lines, options) => getReadyActions().pushLocal(title, lines, options),
     mcpStatus: () => getReadyActions().mcpStatus(),
     exportSession: () => getReadyActions().exportSession(),
     initWorkspace: () => getReadyActions().initWorkspace(),
@@ -164,6 +164,11 @@ export function createChannelActionReadiness() {
   return {
     install(next: ChannelActionDelegates): void {
       if (delegates !== undefined) throw new Error('dsh-tui: Channel actions are already installed')
+      delegates = Object.freeze(next)
+    },
+    /** Replace the installed table (the adoption-window extension, core/compose.ts). */
+    reinstall(next: ChannelActionDelegates): void {
+      if (delegates === undefined) throw new Error('dsh-tui: Channel actions are not installed')
       delegates = Object.freeze(next)
     },
     getReadyActions(): ChannelActionDelegates {
@@ -279,7 +284,7 @@ export function createUnavailableActionDelegates(
     exportSession: () => refuse('export', null),
     initWorkspace: () => refuse('init', null),
     doctorInfo: () => unavailableLines('doctor'),
-    pluginsInfo: () => unavailableLines('plugins'),
+    pluginsInfo: () => Promise.resolve(unavailableLines('plugin')),
     listSubagents: () => Promise.resolve(unavailableLines('agents')),
   }
 }

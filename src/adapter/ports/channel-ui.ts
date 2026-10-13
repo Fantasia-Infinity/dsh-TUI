@@ -1,5 +1,5 @@
 /** Host-owned in-process Channel contract. No runtime or upstream imports. */
-import type { ChatRow, AgentStatus, TokenUsage, TurnUsageSummary, SessionCostByModel, SubagentCostEntry, NotificationItem, ChannelGoal, TodoPanelItem, LoadedContext, PendingMessage, ChannelSceneMetadata, SubagentState, SubagentControl, BackgroundJobState, JobControl, StagedImageInput, StagedImageHandle, ComposerImageRef, ComposerSubmission, ExternalCommandOutcome, TranscriptImage, ResumeResult, EffortOption, PermissionPresetSnapshot, PresetOption, LlmModelInfo, LlmProviderInfo, SkillInfo, CredentialStatus, AgentViewRow, AgentViewDispatchResult, BackgroundResult, RawTrajEvent, TrajectoryLane, TrajectorySource, ChannelSelection, AttachedContext, CompactionStatus, ContextOccupancy, ChannelCapabilities, ChannelCostReport, ChannelRateLimit, ChannelSessionRef, BackendModeOption, BackendChannelOption, BackendChannelInput } from './channel-view.js'
+import type { ChatRow, AgentStatus, TokenUsage, TurnUsageSummary, SessionCostByModel, SubagentCostEntry, NotificationItem, ChannelGoal, TodoPanelItem, LoadedContext, PendingMessage, ChannelSceneMetadata, SubagentState, SubagentControl, BackgroundJobState, JobControl, StagedImageInput, StagedImageHandle, ComposerImageRef, ComposerSubmission, ExternalCommandOutcome, TranscriptImage, ResumeResult, EffortOption, PermissionPresetSnapshot, PresetOption, LlmModelInfo, LlmProviderInfo, SkillInfo, CredentialStatus, AgentViewRow, AgentViewDispatchResult, BackgroundResult, RawTrajEvent, TrajectoryLane, TrajectorySource, ChannelSelection, AttachedContext, CompactionStatus, ContextOccupancy, ContextBreakdown, ChannelCapabilities, ChannelCostReport, ChannelRateLimit, ChannelSessionRef, BackendModeOption, BackendChannelOption, BackendChannelInput } from './channel-view.js'
 import type { SpinnerMode, ToolBackground, ScrollGutterMode, PageMarginSetting, StatusBarConfig, SessionModeSpec, SplashFontSetting, JobGroupFoldMode, BrandSetting } from './channel-display.js'
 import type { LocalCommand, CommandCompletion, BalanceResult, FileCandidate, RecapOutcome } from './channel-catalog.js'
 import type { AgentCapabilities } from './channel-capabilities.js'
@@ -11,6 +11,8 @@ import type { ProviderSetupHost, OAuthProviderStatus, OAuthSetupHost, SettingsHo
 export interface BackendAuthHost {
   /** Report status, present OAuth, then reconnect after sign-in or sign-out. */
   login(present: (oauth: OAuthSetupHost, provider: string) => Promise<'added' | 'updated' | 'deleted' | 'signed-out' | 'cancelled' | 'failed'>): Promise<void>
+  /** Remove only this backend's host OAuth credential, never its native login. */
+  logout?(): Promise<boolean>
 }
 
 /** Relay profile management for the bound backend session. */
@@ -24,6 +26,16 @@ export interface BackendChannelsHost {
 }
 export interface BackendModesHost { snapshot(): { modes: readonly BackendModeOption[]; currentIndex: number }; set(id: string): Promise<boolean> }
 export interface BackendMcpHost { reconnect(name: string): Promise<boolean>; toggle(name: string, enabled: boolean): Promise<boolean> }
+/** The bound session's typed `goals` capability (`/goal` on a non-DSH
+ *  session): each call resolves true once the backend took the change
+ *  (the goal itself arrives as `goal.change`), false after a reported
+ *  failure. */
+export interface BackendGoalsHost {
+  set(objective: string, options?: { readonly tokenBudget?: number }): Promise<boolean>
+  pause(): Promise<boolean>
+  resume(): Promise<boolean>
+  clear(): Promise<boolean>
+}
 
 /**
  * The public channel surface a screen renders: the full transcript and live
@@ -35,6 +47,16 @@ export interface BackendMcpHost { reconnect(name: string): Promise<boolean>; tog
 export interface ChannelUi {
   /** Monotonic version — bump on every mutation so screens can re-render. */
   readonly version: number
+  /**
+   * Whether a live session stands behind this channel. `false` only while
+   * the startup session is still opening or after that open failed: typing
+   * is accepted, but the composer refuses to send and only the purely local
+   * commands run (`isBootSafeCommand`).
+   */
+  readonly ready: boolean
+  /** Why the startup session failed to open, while it stays unopened (the
+   *  placeholder is still bound); cleared once a session is adopted. */
+  readonly startupFailure: string | undefined
   readonly rows: readonly ChatRow[]
   /** Live editor selection from the IDE channel (undefined = no IDE / no
    *  selection / link dropped). Protocol-2 pushes carry the editor buffer's
@@ -183,6 +205,17 @@ export interface ChannelUi {
    * `keyof ChannelUi`, and an optional member would widen that union.
    */
   readonly contextOccupancy: ContextOccupancy | undefined
+  /**
+   * What the occupancy total is made of, from the same meter unit's
+   * `contextBreakdown` projection (system prompt / request-envelope tool schemas
+   * / everything else). The segmented bar joins it with {@link contextSegments}
+   * to weight its five fills; `undefined` when the mounted meter does not publish
+   * a composition, in which case the bar uses those estimates alone.
+   *
+   * Never a total: only {@link contextOccupancy} numerator answers how full the
+   * window is (see the type's own doc).
+   */
+  readonly contextBreakdown: ContextBreakdown | undefined
   /** Output tokens per second of the current/last turn's response, when known. */
   readonly tps: number | undefined
   /** Per-turn tps samples (sparkline history), oldest first. */
@@ -368,7 +401,14 @@ export interface ChannelUi {
     question: string,
     options?: { signal?: AbortSignal; onText?: (delta: string) => void },
   ): Promise<{ answer: string | null; error?: string }>
-  /** Estimated context segments by content type (pi-nano-context style bar). */
+  /**
+   * This app's estimate of the context by content type — the weights behind the
+   * segmented bar's five fills (see {@link contextBreakdown} for the meter's own
+   * composition, which takes precedence where it exists). Never a total: the
+   * bar's length and readout come from {@link contextOccupancy}, and
+   * `barSegments` only uses these numbers to weight that authoritative span
+   * (its message side, or the whole composition when no meter value exists).
+   */
   readonly contextSegments: {
     system: number
     prompt: number
@@ -534,16 +574,17 @@ export interface ChannelUi {
   /** Provider-owned workspace subcommands. */
   workspaceCommands(): readonly Pick<TuiWorkspaceCommand, 'name' | 'aliases' | 'description'>[]
   runWorkspaceCommand(name: string, input: string): Promise<TuiWorkspaceCommandResult | undefined>
-  /** Switch the live model (`/model` picker): forks the conversation at its
-   *  current end and continues it with a new agent routed to `provider`/`model`.
-   *  The history replays unchanged; only the request route changes. */
+  /** Switch the live model (`/model` picker): selects the next request's route
+   *  on the same session; its ID, history, and agent are unchanged. */
   switchModel(provider: string, model: string): Promise<boolean>
   /** The live route's effort levels + adapter default for the `/effort`
    *  slider; empty `efforts` after notifying when unsupported/unavailable.
    *  `levelsFallback` is true when the ladder is the CLI-standard
    *  compatibility offer (the model row declares no tiers of its own) —
-   *  the slider marks it as such instead of implying the model's list. */
-  listEfforts(): Promise<{ efforts: readonly EffortOption[]; defaultEffort: string | undefined; levelsFallback?: true }>
+   *  the slider marks it as such instead of implying the model's list.
+   *  With a route, previews that model for `/model` without changing live
+   *  state or emitting unsupported/single-tier notifications. */
+  listEfforts(route?: { provider: string; model: string }): Promise<{ efforts: readonly EffortOption[]; defaultEffort: string | undefined; levelsFallback?: true }>
   /** Set one effort level by id (validated against the adapter list);
    *  false + a notify when the id is not offered. Persists like the old
    *  Shift+Tab cycle (~/.dsh-tui/effort.json). */
@@ -563,6 +604,11 @@ export interface ChannelUi {
   backendChannels(): BackendChannelsHost | undefined
   backendModes(): BackendModesHost | undefined
   backendMcp(): BackendMcpHost | undefined
+  /** Backend-owned `/init`; DSH keeps its synchronous initWorkspace path. */
+  backendInit(): { run(): Promise<boolean> } | undefined
+  /** `/goal` on a session with the typed `goals` capability; undefined
+   *  otherwise (DSH's /goal is its command registry row). */
+  backendGoals(): BackendGoalsHost | undefined
   /** Read the official permission preset roster and current identity. */
   permissionPresets(): PermissionPresetSnapshot
   /**
@@ -694,8 +740,10 @@ export interface ChannelUi {
    *  this channel's own request carries an abort signal it may fire. */
   cancelCompact(): void
   /** Render a multi-line local report in the transcript (`/status`,
-   *  `/doctor`, …): a `local` row plus one `local-output` row per line. */
-  pushLocal(title: string, lines: readonly string[]): void
+   *  `/doctor`, …): a `local` row plus one `local-output` row per line.
+   *  `lineLimit` overrides the default per-line cell budget for a report
+   *  whose line IS the payload (`/goal`'s objective) so it is not clipped. */
+  pushLocal(title: string, lines: readonly string[], options?: { readonly lineLimit?: number }): void
   /** MCP server/tool status for /mcp: one line per server, or setup guidance. */
   mcpStatus(): string[]
   /** Write the conversation transcript to `dsh-tui-export-<ts>.md` in the
@@ -706,9 +754,11 @@ export interface ChannelUi {
   initWorkspace(): string | null
   /** Environment diagnostics for `/doctor`. */
   doctorInfo(): string[]
-  /** Plugin contract/grant/ledger diagnostics for `/plugins` (C-070 trust
-   *  banner first line; `check <path>` runs validatePlugin + negotiate). */
-  pluginsInfo(args: string): string[]
+  /** Plugin contract/grant/ledger diagnostics for `/plugin` (C-070 trust
+   *  banner first line; `check <path>` runs validatePlugin + negotiate), plus
+   *  the profile's bundles and rows from the host plugin service. The service
+   *  is optional: an absent one answers with the diagnostics and a reason. */
+  pluginsInfo(args: string): Promise<string[]>
   /** Subagent rows for `/agents` (DSH subagent service; empty message when
    *  the service is absent). */
   listSubagents(): Promise<string[]>

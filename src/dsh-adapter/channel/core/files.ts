@@ -7,7 +7,7 @@
  * own commands join the command list itself (core/session-controls.ts), so
  * completion lists them like any other entry.
  */
-import type { Context } from '@deepseek-ai/cordis'
+import type { ServiceLookup } from '../channel-host.js'
 import type { CommandCompletionNode } from '../../../commands.js'
 import type { ChannelBinding } from '../binding.js'
 import { createCommandCompletions } from '../command-completions.js'
@@ -28,6 +28,11 @@ export interface CompletionCatalog {
     presetOptions(): readonly { id: string; description?: string; name?: string; isDefault?: boolean }[]
     warmEffortLevels(): void
   }
+  /** `/plugin info <name>`: the bundles the profile added (absent = no service). */
+  plugin?: {
+    warmPluginNames(): void
+    pluginNames(): readonly CommandCompletionNode[]
+  }
 }
 
 /** No argument catalogs: the tree offers its static nodes only. */
@@ -42,7 +47,7 @@ export const NO_COMPLETION_CATALOG: CompletionCatalog = {
   },
 }
 
-export function createCoreFiles(ctx: Context, deps: {
+export function createCoreFiles(ctx: ServiceLookup, deps: {
   owner: Pick<ChannelOwner, 'current' | 'signal'>
   binding: Pick<ChannelBinding, 'capture' | 'isCurrent'>
   state: () => ChannelState
@@ -77,6 +82,7 @@ export function createCoreFiles(ctx: Context, deps: {
         workspaceCommands: catalog.workspaceCommands,
         ...(deps.mcpServers === undefined ? {} : { mcpServers: deps.mcpServers }),
         model: catalog.model,
+        ...(catalog.plugin === undefined ? {} : { plugin: catalog.plugin }),
       })
     },
   }

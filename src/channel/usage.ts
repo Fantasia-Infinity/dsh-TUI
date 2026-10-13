@@ -55,6 +55,11 @@ export function addUsageToBucket(bucket: TokenBucket, usage: UsageDelta): void {
  * harness `contextPressure` projection, `projectedTokens ?? pressureTokens`, see
  * `dsh-adapter/context-occupancy.ts`); these numbers only describe what the
  * segmented bar is made of and must never be summed into that total.
+ * The bar's span is anchored to that occupancy instead (`contextBarColumns`),
+ * so the role of these estimates is to WEIGHT the fills: the harness's own
+ * `contextBreakdown` supplies the system/envelope/message split where it exists,
+ * and these numbers split its message side and stand in for the whole
+ * composition where it does not. No span is ever derived from them alone.
  */
 
 /** ASCII, including control bytes and ANSI escapes: ~4 characters per token. */
@@ -117,10 +122,24 @@ function isDenseScript(codePoint: number): boolean {
  * @returns The estimated token count (0 for empty input).
  */
 export function estimateTokens(text: string): number {
+  return Math.ceil(estimateTokensFraction(text))
+}
+
+/**
+ * The same script-weighted estimate as estimateTokens, WITHOUT the per-call
+ * rounding: a fractional token count that is exactly additive over fragments.
+ * The live tps path accumulates this over stream deltas and rounds ONCE at
+ * the read -- per-delta ceil would inflate a stream of 2-3 character deltas
+ * to one token each (4x for ASCII), and the old chars/4 fallback under-
+ * counted CJK ~3x (one ideograph is ~0.7-1 token, not 0.25).
+ * @param text - Any text fragment (a stream delta).
+ * @returns the fractional token estimate (0 for empty input).
+ */
+export function estimateTokensFraction(text: string): number {
   if (text === '') return 0
   // Fast path: ASCII-only text is exactly the legacy rate, and the regex scan
   // keeps the overwhelmingly common English case cheaper than a code-point walk.
-  if (!NON_ASCII_RE.test(text)) return Math.ceil(text.length / CHARS_PER_TOKEN_ASCII)
+  if (!NON_ASCII_RE.test(text)) return text.length / CHARS_PER_TOKEN_ASCII
   let ascii = 0
   let dense = 0
   let other = 0
@@ -132,10 +151,10 @@ export function estimateTokens(text: string): number {
     else if (isDenseScript(codePoint)) dense += 1
     else other += 1
   }
-  return Math.ceil(
+  return (
     ascii / CHARS_PER_TOKEN_ASCII
     + dense / CHARS_PER_TOKEN_CJK
-    + other / CHARS_PER_TOKEN_OTHER,
+    + other / CHARS_PER_TOKEN_OTHER
   )
 }
 

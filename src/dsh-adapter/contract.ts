@@ -15,6 +15,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { ADAPTER_TYPE_PACKAGES, HOST_TYPE_PACKAGES } from './host-contract.js'
 
 /** Primary validated upstream line (newest). */
 export const UPSTREAM_VALIDATED_VERSION = '0.2.0-rc.2'
@@ -100,6 +101,12 @@ export const UPSTREAM_BLESSED_PACKAGES = [
   '@deepseek-ai/dsh-tool-subagent',
   '@deepseek-ai/dsh-user-approval',
   '@deepseek-ai/dsh-user-questions',
+  // The packages the standalone entry's host boot takes types from
+  // (./host-contract.ts; loaded from the host by realpath).
+  ...HOST_TYPE_PACKAGES,
+  // The packages the adapter takes types from for host services it reaches
+  // through `ctx` (./host-contract.ts; the host CLI supplies them).
+  ...ADAPTER_TYPE_PACKAGES,
 ] as const
 
 export interface UpstreamDriftEntry {
@@ -116,6 +123,14 @@ const OPTIONAL_RUNTIME_PACKAGES = new Set<string>([
   '@deepseek-ai/dsh-deepseek-account',
   '@deepseek-ai/dsh-host-webserver',
   '@deepseek-ai/dsh-web-app',
+  // Never resolved from this package at run time: the standalone entry loads
+  // them from the installed dsh by realpath (./host-dsh.ts), and a profile
+  // has no copy of them (peers are not auto-installed there).
+  ...HOST_TYPE_PACKAGES,
+  // Same reason, a different route: these are reached through `ctx` inside a
+  // booted profile, where the package the dsh CLI ships resolves through the
+  // loader. The consumer answers with a degradation notice when it is absent.
+  ...ADAPTER_TYPE_PACKAGES,
 ])
 
 /** Supported upstream prerelease channels in ascending precedence order. */

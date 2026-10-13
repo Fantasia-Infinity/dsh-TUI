@@ -1,10 +1,14 @@
 import React from 'react'
 import { Box, Text, useAnimationFrame } from '../ui.js'
-import wrapText from '../ink/wrap-text.js'
+import wrapText, { wrapTextLines } from '../ink/wrap-text.js'
 import type { ChannelUi as Channel } from '../adapter/channel/ui-policy.js'
 import type { ChannelGoal, TodoPanelItem } from '../dsh-adapter/channel.js'
 import { t } from '../i18n.js'
 import { primaryComboString } from '../utils/keymap.js'
+import { formatGoalBudget, formatGoalBudgetCompact } from '../channel/goal-command.js'
+import { useTooltip } from './Tooltip.js'
+import type { DOMElement } from '../ink/dom.js'
+import { stringWidth } from '../ink/stringWidth.js'
 
 /** Maximum todo rows shown before the overflow line. */
 const MAX_TODOS = 8
@@ -38,16 +42,18 @@ function formatDuration(ms: number): string {
 }
 
 /**
- * Compact goal chip for the status footer: phase glyph + rounds, colored by
+ * Compact goal chip for the status footer: phase glyph + rounds (a goal a
+ * backend budgets by tokens: tokens used / budget instead), colored by
  * phase. `minimal` swaps the glyph for a text form, per the minimal-mode
  * no-emoji contract.
  */
 export function GoalStatusChip({ goal, minimal = false }: { goal: ChannelGoal; minimal?: boolean }): React.ReactNode {
+  const progress = goal.budget === undefined ? `${goal.roundsStarted}/${goal.maxGoalRounds}` : formatGoalBudgetCompact(goal.budget)
   return (
     <Text color={phaseColor(goal.phase)} dimColor={goal.phase === 'complete'}>
       {minimal
-        ? `goal ${goal.roundsStarted}/${goal.maxGoalRounds}`
-        : `${PHASE_GLYPH[goal.phase]} ${goal.roundsStarted}/${goal.maxGoalRounds}`}
+        ? `goal ${progress}`
+        : `${PHASE_GLYPH[goal.phase]} ${progress}`}
     </Text>
   )
 }
@@ -56,15 +62,26 @@ function PhaseBadge({
   phase,
   roundsStarted,
   maxGoalRounds,
+  budget,
   elapsed,
 }: {
   phase: ChannelGoal['phase']
   roundsStarted: number
   maxGoalRounds: number
+  /** A token/time budget the backend reports: shown instead of the rounds
+   *  (its own time used replaces the panel's wall clock). */
+  budget?: ChannelGoal['budget']
   /** Wall-clock age of the goal, from the panel's own timer. */
   elapsed?: string
 }): React.ReactNode {
   const color = phaseColor(phase)
+  if (budget !== undefined) {
+    return (
+      <Text color={color} dimColor={phase === 'complete'}>
+        {PHASE_LABEL[phase]} · {formatGoalBudget(budget)}
+      </Text>
+    )
+  }
   return (
     <Text color={color} dimColor={phase === 'complete'}>
       {PHASE_LABEL[phase]} · {roundsStarted}/{maxGoalRounds}
@@ -139,6 +156,14 @@ export function GoalTodoPanel({
   wrapWidth?: number
 }): React.ReactNode {
   const goal = channel.goal
+  const objectiveRef = React.useRef<DOMElement | null>(null)
+  const goalTooltip = useTooltip(() => {
+    const width = objectiveRef.current?.yogaNode?.getComputedWidth() ?? 0
+    if (goal === undefined || width <= 0) return ''
+    return stringWidth(goal.objective) > width || goal.objective.includes('\n')
+      ? goal.objective
+      : ''
+  })
   const allTodos = channel.todos ?? []
   const doneCount = allTodos.filter(todo => todo.status === 'completed').length
   // Completed rows are useful progress while a turn is running, but become
@@ -200,7 +225,7 @@ export function GoalTodoPanel({
   if (wrapWidth !== undefined && wrapWidth > 4) {
     let used = 0
     for (const todo of todos) {
-      const wrapped = wrapText(todo.content, wrapWidth, 'wrap').split('\n')
+      const wrapped = wrapTextLines(todo.content, wrapWidth).map(line => line.text)
       const lines = wrapped.length <= 2
         ? wrapped
         : [wrapped[0]!, wrapText(wrapped.slice(1).join(''), wrapWidth, 'truncate')!]
@@ -233,7 +258,7 @@ export function GoalTodoPanel({
               truncate）。 */}
           <Box flexDirection="row" width="100%" height={1}>
             <Text color="suggestion">🎯 </Text>
-            <Box flexGrow={1} flexShrink={1}>
+            <Box ref={objectiveRef} flexGrow={1} flexShrink={1} {...goalTooltip}>
               <Text bold wrap="truncate">
                 {goal.objective}
               </Text>
@@ -243,6 +268,7 @@ export function GoalTodoPanel({
                 phase={goal.phase}
                 roundsStarted={goal.roundsStarted}
                 maxGoalRounds={goal.maxGoalRounds}
+                budget={goal.budget}
                 elapsed={elapsed}
               />
             </Box>

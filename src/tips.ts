@@ -327,8 +327,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'cmd-model',
     group: 'commands',
-    zh: '/model 换模型会 fork 续聊，历史不丢',
-    en: '/model forks to continue: history is preserved',
+    zh: '/model 同会话换模型，历史不丢',
+    en: '/model switches in place: session and history are preserved',
   },
   {
     id: 'cmd-effort',
@@ -417,8 +417,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'cmd-plugins',
     group: 'commands',
-    zh: '/plugins check <清单路径> 诊断插件兼容性',
-    en: '/plugins check <manifest> diagnoses plugin compatibility',
+    zh: '/plugin check <清单路径> 诊断插件兼容性',
+    en: '/plugin check <manifest> diagnoses plugin compatibility',
   },
   {
     id: 'cmd-update',
@@ -449,8 +449,8 @@ export const TIPS: readonly Tip[] = [
   {
     id: 'flow-steer',
     group: 'workflow',
-    zh: '模型工作时：Enter 加塞、Tab 排队、Ctrl+Enter 打断',
-    en: 'While working: Enter steers, Tab queues, Ctrl+Enter interrupts',
+    zh: '模型工作时：Enter 加塞、Tab 排队、Ctrl+Enter 打断；/ 命令照常执行',
+    en: 'While working: Enter steers, Tab queues, Ctrl+Enter interrupts; / commands still run',
   },
   {
     id: 'flow-alt-up',
